@@ -1,0 +1,36 @@
+# Custom controllers for Nintendo Switch Pro / 8BitDo Ultimate C (Bluetooth)
+0x057e, 0x2009, Nintendo Switch Pro / 8BitDo Ultimate C, XTYPE_SWITCH_PRO
+0x2dc8, 0x2009, 8BitDo Switch Pro Controller, XTYPE_SWITCH_PRO
+0x2dc8, 0x3100, 8BitDo Wireless Adapter (Switch Mode), XTYPE_SWITCH_PRO
+
+# Add your custom controller VID/PIDs here, one line per device.
+# Install this file as /dev_hdd0/plugins/xpad_devices.txt on the PS3.
+#
+# Format: VID, PID, NAME, XTYPE   ('#' starts a comment anywhere)
+# Values are separated by commas; extra spaces around them are fine.
+# A maximum of 24 custom controllers may be registered in addition to the
+# built-in ones. Duplicates of built-in devices are skipped silently, so it
+# is safe to list a pad that turns out to be supported already.
+#
+# XTYPE rules:
+#  - XTYPE_XBOX360   Wired XInput pads AND 2.4GHz USB dongles (8BitDo,
+#                    GameSir, etc.). 2.4GHz dongles present themselves as a
+#                    wired Xbox 360 pad, so one entry covers a pad whose
+#                    wired and dongle modes share the same VID/PID.
+#  - XTYPE_XBOX360W  ONLY the Microsoft Xbox 360 4-pad wireless receiver
+#                    (045e:0291 / 045e:0719). Do NOT use this for
+#                    third-party 2.4GHz dongles - they speak the wired
+#                    protocol; non-Microsoft VIDs marked XBOX360W are
+#                    registered as wired with a warning.
+#  - XTYPE_XBOX, XTYPE_XBOXONE, PTYPE_PS3, PTYPE_PS4, PTYPE_BT are
+#    recognized but not implemented yet; such lines are skipped with a
+#    notification at boot.
+#
+# To find a controller's VID/PID: plug it into the PS3 - if it is
+# recognized, the notification shows "NAME (VID:PID) on port N". Otherwise
+# check Windows Device Manager (Hardware IDs) or `lsusb` on Linux.
+#
+# Examples (remove the leading '#' and edit to use):
+# VID, PID, NAME, XTYPE
+#0x2dc8, 0x310c, My 8BitDo pad, XTYPE_XBOX360
+#0x3537, 0x1010, My GameSir pad, XTYPE_XBOX360

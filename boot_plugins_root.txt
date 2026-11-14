@@ -1,0 +1,4 @@
+/dev_hdd0/plugins/qDNSm.sprx
+/dev_hdd0/plugins/webftp_server.sprx
+/dev_hdd0/tmp/wm_res/wm_vsh_menu.sprx
+/dev_hdd0/plugins/xpad.sprx
