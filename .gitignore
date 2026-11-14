@@ -1,0 +1,23 @@
+# Build artifacts
+src/objs/
+game/objs/
+game/src/
+*.o
+*.d
+*.sym
+*.prx
+*.sprx
+
+# Debug logs
+*.log
+
+# Temporary files
+TEMP_*.h
+boot_plugins_*.txt
+transfer_and_restart.bat
+
+# OS junk
+CON
+Thumbs.db
+desktop.ini
+.DS_Store
