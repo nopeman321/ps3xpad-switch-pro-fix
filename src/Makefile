@@ -25,7 +25,7 @@ PPU_PRX_LDFLAGS += -mprx -ffunction-sections -fdata-sections -Wl,--strip-unused-
 PPU_PRX_STRIPFLAGS += --strip-debug --strip-section-header
 
 PPU_INCDIRS += -I$(CELL_TARGET_PATH)/ppu/include/cell/net
-PPU_SRCS = libc.c main.c
+PPU_SRCS = libc.c main.c bt_dongle.c
 PPU_PRX_LDLIBS 	= -lusbd_stub -lio_stub -lfs_stub #-ldbg_libio_stub
 PPU_PRX_TARGET = xpad.prx
 

@@ -1,5 +1,7 @@
 # ps3xpad — Nintendo Switch Pro Controller support for PS3
 
+[![CI](https://github.com/nopeman321/ps3xpad-switch-pro-fix/actions/workflows/ci.yml/badge.svg)](https://github.com/nopeman321/ps3xpad-switch-pro-fix/actions/workflows/ci.yml)
+
 `xpad.sprx` is a VSH plugin for PS3 (CFW with PS3HEN / webMAN MOD) that registers USB
 gamepads with the system through the `cellUsbd` LDD interface, so games and the XMB see
 them as first-party pads.
@@ -37,18 +39,23 @@ All three are fixed here.
 | Feature | Status |
 |---|---|
 | USB HID enumeration (`057E:2009`, 8BitDo Switch mode) | ✅ |
+| Wireless Bluetooth 5.3 Dongle (`0BDA:A729` Realtek, `0A12:0001`, `0A5C:21E8`) | ✅ |
+| Realtek RTL8761BU on-dongle firmware loader (`0xFC20`) | ✅ |
 | Asynchronous init state machine (`0x80` → `0x03` → IMU → vibration → LED) | ✅ |
+| Bluetooth L2CAP stack (Signaling, HID Control & Interrupt) | ✅ |
 | Full report `0x30` / subcommand reply `0x21` decoding | ✅ |
 | Simple HID report `0x3F` fallback | ✅ |
 | 12-bit little-endian analog sticks → 8-bit PS3 axes | ✅ |
 | PlayStation face-button layout | ✅ |
 | Rumble (`0x10`) and player LED (`0x30`) | ✅ |
+| Bluetooth keepalive and auto-reconnect with persistent MAC storage | ✅ |
 | Clean detach, no leaked pipes on unload | ✅ |
 
 ---
 
 ## Installation
 
+### Wired Mode (USB)
 1. Copy `xpad.sprx` to `/dev_hdd0/plugins/` on your PS3.
 2. Add this line to `/dev_hdd0/boot_plugins.txt`:
 
@@ -57,6 +64,13 @@ All three are fixed here.
    ```
 
 3. Reboot the console (or hot-reload via webMAN / PS3MAPI).
+
+### Wireless Mode (Realtek RTL8761BU Bluetooth 5.3 Dongle)
+1. Copy `xpad.sprx` and `rtl8761bu_fw.bin` to `/dev_hdd0/plugins/` on your PS3.
+2. Plug the Realtek RTL8761BU USB Bluetooth dongle into any PS3 USB port.
+3. Turn on your 8BitDo Ultimate C / Switch Pro controller (or hold pairing button for initial pair).
+4. `xpad.sprx` will upload firmware to the dongle in ~1.3s, auto-discover the controller, and connect wirelessly.
+5. The learned controller MAC address is persistently saved to `/dev_hdd0/plugins/xpad_bt_mac.bin` for instant reconnect on future boots.
 
 > **Do not** load `xpad_game.sprx` from `boot_plugins.txt`. It is a game-process
 > plugin for rumble forwarding and must be injected per-game (webMAN → *Game Plugins*),
@@ -158,14 +172,30 @@ simple-HID mode.
 > shifts. Never cast the USB buffer to a packed struct on the PPU — it is
 > big-endian, and a direct struct read silently returns byte-swapped values.
 
+### Known limitation: `0x3F` stick scaling
+
+The `0x3F` branch reads one byte per axis (`readBuf[5]`, `[7]`, `[9]`, `[11]`) instead
+of assembling the full 16-bit little-endian value, so simple-HID sticks have coarse
+resolution and a compressed range. Pads that complete the `0x30` init (the normal
+path) are unaffected. Fixing this needs hardware verification of the `0x3F` axis
+layout, so it is left as-is rather than guessed at.
+
 ---
 
 ## Building
 
-Requires the Sony Cell SDK (PPU toolchain) and `scetool`.
+Requires the Sony Cell SDK (PPU toolchain) and `scetool`. The SDK is proprietary and
+cannot run on a hosted CI runner, so the PRX build stays a local step. The host-side
+protocol tests *do* run in CI (see `.github/workflows/ci.yml`).
 
 ```sh
 CELL_SDK=C:/usr/local/cell sh tools/build_windows.sh
+```
+
+Run the protocol tests (plain C11, no PS3 hardware needed):
+
+```sh
+make -C tests test
 ```
 
 `tools/build_windows.sh` compiles both plugins, then runs `scetool` from its own

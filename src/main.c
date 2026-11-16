@@ -16,6 +16,7 @@
 #include <cell/cell_fs.h>
 #include "ControlStruct.h"
 #include "xpad_rumble.h"
+#include "bt_dongle.h"
 
 #define THREAD_NAME "xpaddt"
 #define STOP_THREAD_NAME "xpadds"
@@ -164,7 +165,8 @@
 enum XTYPES {
   XTYPE_XBOX360 = 1,
   XTYPE_XBOX360W = 2,
-  XTYPE_SWITCH_PRO = 3
+  XTYPE_SWITCH_PRO = 3,
+  XTYPE_BTD = 4
 };
 
 // ---------------------------------------------------------------------------
@@ -405,6 +407,7 @@ typedef struct xpad_unit {
   uint8_t as; /* Alternate setting number */
   int32_t tcount; /* Transfer counts */
   uint8_t xtype;
+  uint8_t is_bt;
 
   // methods to their respective controllers
   int32_t (*read_input)(struct xpad_unit *unit, void *data);
@@ -444,6 +447,7 @@ typedef struct xpad_unit {
   uint8_t swpro_inited;
   uint8_t swpro_state;
   int32_t swpro_timer;
+  uint32_t swpro_keepalive_timer;
 
   /* Buffer for interrupt transfer */
   unsigned char data[0];
@@ -529,9 +533,9 @@ static void notify_pad_connected(XPAD_UNIT_t *unit);
 static void notify_pad_disconnected(XPAD_UNIT_t *unit);
 
 // debug logging to XPAD_LOG_PATH (no-ops if the log file cannot be created)
-static void xlog(const char *text);
-static void xlog_code(const char *what, int32_t code);
-static void xlog_dev(const char *what, uint16_t vid, uint16_t pid, int32_t code);
+void xlog(const char *text);
+void xlog_code(const char *what, int32_t code);
+void xlog_dev(const char *what, uint16_t vid, uint16_t pid, int32_t code);
 static void xlog_proc(const char *what, const char *name, uint32_t pid);
 
 // vsh methods
@@ -574,6 +578,22 @@ static CellUsbdLddOps swpro_ops = {
   swpro_attach,
   swpro_detach
 };
+
+static CellUsbdLddOps btd_ops = {
+  0,
+  btd_probe,
+  btd_attach,
+  btd_detach
+};
+
+static XPAD_INFO_t btd_info[] = {
+  {0x0BDA, 0xA729, "Realtek Bluetooth 5.3 Adapter"},
+  {0x0A12, 0x0001, "CSR8510 Bluetooth Dongle"},
+  {0x0A5C, 0x21E8, "Broadcom BCM20702 Bluetooth Dongle"}
+};
+#define MAX_BTD_DEV_NUM ((int32_t)(sizeof(btd_info) / sizeof(btd_info[0])))
+static uint8_t btd_lddreg[sizeof(btd_info) / sizeof(btd_info[0])];
+static uint8_t btd_class_registered = 0;
 
 static XPAD_t XPAD;
 static uint8_t xpad_led[4] = {ledOn1, ledOn2, ledOn3, ledOn4};
@@ -777,7 +797,7 @@ static void xlog_init(void) {
   xlog("xpad debug log start (timestamps: seconds since plugin start)");
 }
 
-static void xlog(const char *text) {
+void xlog(const char *text) {
   char buf[224], *m;
   int32_t fd;
   uint64_t nw, dt;
@@ -811,7 +831,7 @@ static void xlog(const char *text) {
 }
 
 // "<what> (code 0x00000000)"
-static void xlog_code(const char *what, int32_t code) {
+void xlog_code(const char *what, int32_t code) {
   char msg[192], *m;
 
   if (!log_ok) {
@@ -826,7 +846,7 @@ static void xlog_code(const char *what, int32_t code) {
 }
 
 // "<what> VID:PID (code 0x00000000)"; code 0 is omitted
-static void xlog_dev(const char *what, uint16_t vid, uint16_t pid, int32_t code) {
+void xlog_dev(const char *what, uint16_t vid, uint16_t pid, int32_t code) {
   char msg[192], *m;
 
   if (!log_ok) {
@@ -1078,9 +1098,11 @@ static void load_extra_devices(void) {
       // Nintendo Switch Pro protocol (Nintendo HID, not XInput). Use this for
       // 8BitDo/GameSir pads in Switch mode whose VID/PID is not in switch_info.
       xtype = XTYPE_SWITCH_PRO;
-    } else if (strcasecmp(xt, "XTYPE_XBOX") == 0 || strcasecmp(xt, "XTYPE_XBOXONE") == 0 ||
-               strcasecmp(xt, "PTYPE_PS3") == 0 || strcasecmp(xt, "PTYPE_PS4") == 0 ||
+    } else if (strcasecmp(xt, "XTYPE_BTD") == 0 || strcasecmp(xt, "XTYPE_BT_DONGLE") == 0 ||
                strcasecmp(xt, "PTYPE_BT") == 0) {
+      xtype = XTYPE_BTD;
+    } else if (strcasecmp(xt, "XTYPE_XBOX") == 0 || strcasecmp(xt, "XTYPE_XBOXONE") == 0 ||
+               strcasecmp(xt, "PTYPE_PS3") == 0 || strcasecmp(xt, "PTYPE_PS4") == 0) {
       devlist_warn(line_no, "type not supported yet");
       line = next;
       continue;
@@ -1197,6 +1219,9 @@ static void data_transfer_done(int32_t result, int32_t count, void *arg) {
     return;
   }
   if (result == CELL_OK) {
+    if (unit->xtype == XTYPE_SWITCH_PRO && count >= 10 && unit->data[0] == 0x81 && unit->data[1] == 0x01) {
+      btd_learn_controller_mac(&unit->data[4]);
+    }
     if (!unit->dbg_first_in) {
       unit->dbg_first_in = 1;
       log_first = 1;
@@ -1828,6 +1853,10 @@ void usb_done_cb(int32_t result, int32_t count, void *arg) {
 // caller's stack frame after it returned
 static int32_t write_xpad(XPAD_UNIT_t *unit, uint8_t *data, int32_t len) {
   int32_t r;
+
+  if (unit->is_bt) {
+    return btd_send_hid_output(unit, data, len);
+  }
 
   if (len > XPAD_OUT_LEN) {
     xlog_code("write_xpad failed: len > XPAD_OUT_LEN", len);
@@ -2982,6 +3011,13 @@ static void swpro_read_report(int32_t id, uint8_t *readBuf) {
   data.button[CELL_PAD_BTN_OFFSET_SENSOR_G] = 0x0200;
 
   if (readBuf[0] == SWPRO_IN_FULL || readBuf[0] == SWPRO_IN_SUBCMD_REPLY) {
+    if (readBuf[0] == SWPRO_IN_SUBCMD_REPLY) {
+      static uint8_t s_subcmd_ack_logged = 0;
+      if (!s_subcmd_ack_logged) {
+        s_subcmd_ack_logged = 1;
+        xlog_code("Switch: Received subcmd reply for subcmd", (int32_t)readBuf[14]);
+      }
+    }
     uint8_t btn_right  = readBuf[3];
     uint8_t btn_shared = readBuf[4];
     uint8_t btn_left   = readBuf[5];
@@ -3094,7 +3130,7 @@ static int32_t swpro_read_input(XPAD_UNIT_t *unit, void *data) {
   while (unit->rblen > 0) {
     xpadbuf = &unit->ringbuf[unit->rp][0];
     len = xpadbuf[1];
-    if (len >= 12 && (xpadbuf[2] == SWPRO_IN_FULL || xpadbuf[2] == SWPRO_IN_SUBCMD_REPLY || xpadbuf[2] == SWPRO_IN_SIMPLE)) {
+    if (len >= 3 && (xpadbuf[2] == SWPRO_IN_FULL || xpadbuf[2] == SWPRO_IN_SUBCMD_REPLY || xpadbuf[2] == SWPRO_IN_SIMPLE)) {
       if (len > MAX_XPAD_DATA_LEN - 2) {
         len = MAX_XPAD_DATA_LEN - 2;
       }
@@ -3176,6 +3212,89 @@ static int32_t swpro_set_rumble(XPAD_UNIT_t *unit, uint8_t lval, uint8_t rval) {
   return(CELL_OK);
 }
 // end of Switch Pro controller specific methods
+
+// Bluetooth Dongle bridge methods
+int32_t btd_is_custom_dongle(uint16_t vid, uint16_t pid) {
+  int32_t i;
+  for (i = 0; i < extra_count; i++) {
+    if (extra_info[i].xtype == XTYPE_BTD && extra_info[i].vid == vid && extra_info[i].pid == pid) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+void *btd_create_switch_unit(void) {
+  XPAD_UNIT_t *unit;
+  unit = unit_alloc(-1, SWPRO_FULL_REPORT_LEN, 0, 0, XTYPE_SWITCH_PRO);
+  if (unit == NULL) {
+    xlog("BTD: unit_alloc failed for virtual Switch Pro");
+    return NULL;
+  }
+  unit->vid = 0x057E;
+  unit->pid = 0x2009;
+  unit->name = "Switch Pro Controller (Bluetooth)";
+  unit->is_bt = 1;
+  unit->read_input = swpro_read_input;
+  unit->set_led = swpro_set_led;
+  unit->set_rumble = swpro_set_rumble;
+  unit->o_pipe = -2;
+
+  block(xpad_mutex);
+  if (register_ldd_controller(unit) != CELL_PAD_OK) {
+    unblock(xpad_mutex);
+    unit_free(unit);
+    xlog("BTD: register_ldd_controller failed for virtual Switch Pro");
+    return NULL;
+  }
+  unblock(xpad_mutex);
+  xlog("BTD: virtual Switch Pro registered successfully!");
+  notify_pad_connected(unit);
+  return (void *)unit;
+}
+
+void btd_destroy_switch_unit(void *u) {
+  XPAD_UNIT_t *unit = (XPAD_UNIT_t *)u;
+  if (unit == NULL) return;
+  block(xpad_mutex);
+  if (unit->unit_idx >= 0 && unit->unit_idx < MAX_UNIT_NUM && XPAD.units[unit->unit_idx] == unit) {
+    XPAD.units[unit->unit_idx] = NULL;
+  }
+  unregister_ldd_controller(unit);
+  unblock(xpad_mutex);
+  notify_pad_disconnected(unit);
+  unit_free(unit);
+}
+
+void btd_start_swpro_init(void *u) {
+  XPAD_UNIT_t *unit = (XPAD_UNIT_t *)u;
+  if (unit == NULL) return;
+  unit->swpro_state = SWPRO_STATE_SET_MODE;
+  unit->swpro_timer = 10;
+  unit->swpro_inited = 0;
+}
+
+void btd_push_report(void *u, const uint8_t *report, int32_t len) {
+  XPAD_UNIT_t *unit = (XPAD_UNIT_t *)u;
+  unsigned char *xpadbuf;
+  if (unit == NULL || report == NULL || len <= 0) return;
+
+  block(unit->rb_mutex);
+  if (unit->closing || unit->rblen >= RINGBUF_SIZE) {
+    unblock(unit->rb_mutex);
+    return;
+  }
+  xpadbuf = &unit->ringbuf[unit->wp][0];
+  xpadbuf[0] = (unsigned char)(++unit->tcount & 0xFF);
+  int32_t count = (len <= MAX_XPAD_DATA_LEN - 2) ? len : MAX_XPAD_DATA_LEN - 2;
+  xpadbuf[1] = (unsigned char)(count & 0xFF);
+  memcpy(&xpadbuf[2], report, count);
+  if (++unit->wp >= RINGBUF_SIZE) {
+    unit->wp = 0;
+  }
+  unit->rblen++;
+  unblock(unit->rb_mutex);
+}
 
 static int32_t check_pad_status(void) {
   int32_t i, cr, port, pad;
@@ -3259,6 +3378,13 @@ static int32_t register_one(CellUsbdLddOps *ops, uint16_t vid, uint16_t pid, con
 static int32_t register_devices(void) {
   int32_t r, i;
 
+  // register Bluetooth Dongle device types FIRST
+  for (i = 0; i < MAX_BTD_DEV_NUM; i++) {
+    if ((r = register_one(&btd_ops, btd_info[i].vid, btd_info[i].pid, btd_info[i].name, &btd_lddreg[i])) != CELL_OK) {
+      return(r);
+    }
+  }
+
   // register Nintendo Switch Pro device types FIRST: the LDD table has only
   // ~22 slots and the wired Xbox table below has ~35 entries, so a Switch
   // Pro pad registered after the Xbox table is silently dropped when the
@@ -3289,6 +3415,8 @@ static int32_t register_devices(void) {
       r = register_one(&xpadw_ops, extra_info[i].vid, extra_info[i].pid, extra_info[i].name, &extra_lddreg[i]);
     } else if (extra_info[i].xtype == XTYPE_SWITCH_PRO) {
       r = register_one(&swpro_ops, extra_info[i].vid, extra_info[i].pid, extra_info[i].name, &extra_lddreg[i]);
+    } else if (extra_info[i].xtype == XTYPE_BTD) {
+      r = register_one(&btd_ops, extra_info[i].vid, extra_info[i].pid, extra_info[i].name, &extra_lddreg[i]);
     } else {
       r = register_one(&xpad_ops, extra_info[i].vid, extra_info[i].pid, extra_info[i].name, &extra_lddreg[i]);
     }
@@ -3302,6 +3430,13 @@ static int32_t register_devices(void) {
 // undo every registration register_devices() made (and only those)
 static void unregister_devices(void) {
   int32_t i;
+
+  for (i = 0; i < MAX_BTD_DEV_NUM; i++) {
+    if (btd_lddreg[i]) {
+      cellUsbdUnregisterExtraLdd(&btd_ops);
+      btd_lddreg[i] = 0;
+    }
+  }
 
   for (i = 0; i < MAX_XPAD_DEV_NUM; i++) {
     if (xpad_lddreg[i]) {
@@ -3494,11 +3629,18 @@ static int xpadd_thread(uint64_t arg) {
 #endif
   while (running) {
     sys_timer_usleep(1000 * 10);
+    btd_poll_tick();
     block(xpad_mutex);
     for (i = 0; i < MAX_UNIT_NUM; i++) {
       if ((unit = XPAD.units[i]) != NULL) {
         if (unit->xtype == XTYPE_SWITCH_PRO) {
             process_swpro_init(unit);
+            if (unit->is_bt && unit->swpro_state == SWPRO_STATE_DONE) {
+              if (++unit->swpro_keepalive_timer >= 100) { /* Keepalive every 1.0 second */
+                unit->swpro_keepalive_timer = 0;
+                swpro_set_rumble(unit, 0, 0);
+              }
+            }
         }
         unit->read_input(unit, xpad_data);
       }
@@ -3527,6 +3669,7 @@ static int xpadd_thread(uint64_t arg) {
   xpad_detach_all();
   xpadw_detach_all();
   swpro_detach_all();
+  btd_detach_all();
   shutdown_usb();
   sys_ppu_thread_exit(0);
   return(0);

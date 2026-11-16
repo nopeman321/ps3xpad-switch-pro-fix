@@ -2,11 +2,19 @@
 src/objs/
 game/objs/
 game/src/
+src/data/
+.github/
+tests/test_switch_pro
+tests/test_switch_pro.exe
+tests/test_bt_dongle
+tests/test_bt_dongle.exe
 *.o
 *.d
 *.sym
 *.prx
 *.sprx
+!xpad.sprx
+!game/xpad_game.sprx
 
 # Debug logs
 *.log

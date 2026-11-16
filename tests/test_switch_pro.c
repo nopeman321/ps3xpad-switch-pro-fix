@@ -182,18 +182,29 @@ enum {
 };
 
 /*
- * Nintendo -> PS3 face-button mapping. On the Switch, A sits where B is on
- * an Xbox pad, so the mapping is "diagonal" and this table is the single
+ * Nintendo -> PS3 face-button mapping.
+ *
+ * The Pro Controller's face buttons are physically rotated relative to
+ * PlayStation's: Nintendo's Y sits where PlayStation puts Square, Nintendo's X
+ * where PlayStation puts Triangle, and so on. The driver therefore maps by
+ * PHYSICAL POSITION, not by Nintendo's letter, so a player holding the pad
+ * feels the button they expect under their thumb. This table is the single
  * place that decision lives.
+ *
+ *   position  Nintendo  PS3
+ *   left      Y         Square
+ *   top       X         Triangle
+ *   bottom    B         Cross
+ *   right     A         Circle
  */
 static uint16_t map_face_button(uint8_t nintendo_mask)
 {
     uint16_t ps3 = 0;
 
-    if (nintendo_mask & SWPRO_BTN_A) ps3 |= CELL_PAD_CTRL_CROSS;
-    if (nintendo_mask & SWPRO_BTN_B) ps3 |= CELL_PAD_CTRL_CIRCLE;
-    if (nintendo_mask & SWPRO_BTN_X) ps3 |= CELL_PAD_CTRL_SQUARE;
-    if (nintendo_mask & SWPRO_BTN_Y) ps3 |= CELL_PAD_CTRL_TRIANGLE;
+    if (nintendo_mask & SWPRO_BTN_Y) ps3 |= CELL_PAD_CTRL_SQUARE;   /* left   */
+    if (nintendo_mask & SWPRO_BTN_X) ps3 |= CELL_PAD_CTRL_TRIANGLE; /* top    */
+    if (nintendo_mask & SWPRO_BTN_B) ps3 |= CELL_PAD_CTRL_CROSS;    /* bottom */
+    if (nintendo_mask & SWPRO_BTN_A) ps3 |= CELL_PAD_CTRL_CIRCLE;   /* right  */
     return ps3;
 }
 
@@ -342,14 +353,16 @@ static void test_button_map(void)
 {
     printf("\n[face-button mapping]\n");
 
-    CHECK_EQ(CELL_PAD_CTRL_CROSS,   map_face_button(SWPRO_BTN_A));
-    CHECK_EQ(CELL_PAD_CTRL_CIRCLE,  map_face_button(SWPRO_BTN_B));
-    CHECK_EQ(CELL_PAD_CTRL_SQUARE,  map_face_button(SWPRO_BTN_X));
-    CHECK_EQ(CELL_PAD_CTRL_TRIANGLE,map_face_button(SWPRO_BTN_Y));
+    /* Positional map: each Nintendo button lands on the PS3 button that
+     * occupies the same physical spot on the pad. */
+    CHECK_EQ(CELL_PAD_CTRL_SQUARE,  map_face_button(SWPRO_BTN_Y));  /* left   */
+    CHECK_EQ(CELL_PAD_CTRL_TRIANGLE,map_face_button(SWPRO_BTN_X));  /* top    */
+    CHECK_EQ(CELL_PAD_CTRL_CROSS,   map_face_button(SWPRO_BTN_B));  /* bottom */
+    CHECK_EQ(CELL_PAD_CTRL_CIRCLE,  map_face_button(SWPRO_BTN_A));  /* right  */
 
     /* Combined mask maps to the OR of the individual bits. */
-    CHECK_EQ(CELL_PAD_CTRL_CROSS | CELL_PAD_CTRL_TRIANGLE,
-             map_face_button(SWPRO_BTN_A | SWPRO_BTN_Y));
+    CHECK_EQ(CELL_PAD_CTRL_SQUARE | CELL_PAD_CTRL_CIRCLE,
+             map_face_button(SWPRO_BTN_Y | SWPRO_BTN_A));
 
     /* Nothing pressed maps to nothing. */
     CHECK_EQ(0, map_face_button(0));
@@ -574,8 +587,14 @@ static void test_handshake_and_endpoints(void)
  * Mirror of the mapping in swpro_read_report(). Kept byte-for-byte in step
  * with src/main.c so the tests fail if the two ever drift apart.
  *
- * The face buttons are diagonal on Nintendo hardware: A sits where B is on an
- * Xbox pad, so A->CROSS, B->CIRCLE, X->SQUARE, Y->TRIANGLE.
+ * The face buttons are mapped by physical position, because Nintendo's layout
+ * is rotated relative to PlayStation's:
+ *
+ *   position  Nintendo  PS3
+ *   left      Y         SQUARE
+ *   top       X         TRIANGLE
+ *   bottom    B         CROSS
+ *   right     A         CIRCLE
  */
 typedef struct {
     uint16_t digital1;
@@ -595,11 +614,11 @@ static void swpro_decode(const uint8_t *report, swpro_pad_state_t *out)
 
     memset(out, 0, sizeof(*out));
 
-    /* face buttons (diagonal mapping) */
-    if (btn_right & SWPRO_BTN_X) out->digital2 |= CELL_PAD_CTRL_SQUARE;
-    if (btn_right & SWPRO_BTN_A) out->digital2 |= CELL_PAD_CTRL_CROSS;
-    if (btn_right & SWPRO_BTN_B) out->digital2 |= CELL_PAD_CTRL_CIRCLE;
-    if (btn_right & SWPRO_BTN_Y) out->digital2 |= CELL_PAD_CTRL_TRIANGLE;
+    /* face buttons — positional PlayStation mapping (see map_face_button) */
+    if (btn_right & SWPRO_BTN_Y) out->digital2 |= CELL_PAD_CTRL_SQUARE;
+    if (btn_right & SWPRO_BTN_X) out->digital2 |= CELL_PAD_CTRL_TRIANGLE;
+    if (btn_right & SWPRO_BTN_B) out->digital2 |= CELL_PAD_CTRL_CROSS;
+    if (btn_right & SWPRO_BTN_A) out->digital2 |= CELL_PAD_CTRL_CIRCLE;
 
     /* d-pad and system buttons */
     if (btn_left & SWPRO_BTN_UP)    out->digital1 |= CELL_PAD_CTRL_UP;
@@ -625,10 +644,11 @@ static void swpro_decode(const uint8_t *report, swpro_pad_state_t *out)
     out->press_down  = (btn_left & SWPRO_BTN_DOWN)  ? 0xFF : 0;
     out->press_left  = (btn_left & SWPRO_BTN_LEFT)  ? 0xFF : 0;
     out->press_right = (btn_left & SWPRO_BTN_RIGHT) ? 0xFF : 0;
-    out->press_square   = (btn_right & SWPRO_BTN_X) ? 0xFF : 0;
-    out->press_circle   = (btn_right & SWPRO_BTN_B) ? 0xFF : 0;
-    out->press_cross    = (btn_right & SWPRO_BTN_A) ? 0xFF : 0;
-    out->press_triangle = (btn_right & SWPRO_BTN_Y) ? 0xFF : 0;
+    /* analogue pressure follows the same positional map as digital2 */
+    out->press_square   = (btn_right & SWPRO_BTN_Y) ? 0xFF : 0;
+    out->press_triangle = (btn_right & SWPRO_BTN_X) ? 0xFF : 0;
+    out->press_cross    = (btn_right & SWPRO_BTN_B) ? 0xFF : 0;
+    out->press_circle   = (btn_right & SWPRO_BTN_A) ? 0xFF : 0;
 
     out->lx = report[SWPRO_OFF_STICKS + 0];
     out->ly = report[SWPRO_OFF_STICKS + 1];
@@ -696,36 +716,36 @@ static void test_button_bits(void)
 }
 
 /* ===================================================================== */
-/* Test 11 — face-button diagonal mapping                                */
+/* Test 11 — face-button positional (PlayStation) mapping                */
 /* ===================================================================== */
 
 static void test_face_buttons_diagonal(void)
 {
-    printf("\n[face-button diagonal mapping]\n");
+    printf("\n[face-button positional mapping]\n");
 
     uint8_t report[SWPRO_FULL_REPORT_BYTES];
     swpro_pad_state_t st;
 
-    /* A alone must produce CROSS (not CIRCLE). */
-    make_full_report(report, SWPRO_BTN_A, 0, 0, 0x08, 0x08, 0x08, 0x08);
-    swpro_decode(report, &st);
-    CHECK_EQ(CELL_PAD_CTRL_CROSS, st.digital2);
-    CHECK(st.digital2 != CELL_PAD_CTRL_CIRCLE);
-
-    /* B alone -> CIRCLE */
-    make_full_report(report, SWPRO_BTN_B, 0, 0, 0x08, 0x08, 0x08, 0x08);
-    swpro_decode(report, &st);
-    CHECK_EQ(CELL_PAD_CTRL_CIRCLE, st.digital2);
-
-    /* X alone -> SQUARE */
-    make_full_report(report, SWPRO_BTN_X, 0, 0, 0x08, 0x08, 0x08, 0x08);
-    swpro_decode(report, &st);
-    CHECK_EQ(CELL_PAD_CTRL_SQUARE, st.digital2);
-
-    /* Y alone -> TRIANGLE */
+    /* Y alone (left position) must produce SQUARE. */
     make_full_report(report, SWPRO_BTN_Y, 0, 0, 0x08, 0x08, 0x08, 0x08);
     swpro_decode(report, &st);
+    CHECK_EQ(CELL_PAD_CTRL_SQUARE, st.digital2);
+    CHECK(st.digital2 != CELL_PAD_CTRL_CROSS);
+
+    /* X alone (top) -> TRIANGLE */
+    make_full_report(report, SWPRO_BTN_X, 0, 0, 0x08, 0x08, 0x08, 0x08);
+    swpro_decode(report, &st);
     CHECK_EQ(CELL_PAD_CTRL_TRIANGLE, st.digital2);
+
+    /* B alone (bottom) -> CROSS */
+    make_full_report(report, SWPRO_BTN_B, 0, 0, 0x08, 0x08, 0x08, 0x08);
+    swpro_decode(report, &st);
+    CHECK_EQ(CELL_PAD_CTRL_CROSS, st.digital2);
+
+    /* A alone (right) -> CIRCLE */
+    make_full_report(report, SWPRO_BTN_A, 0, 0, 0x08, 0x08, 0x08, 0x08);
+    swpro_decode(report, &st);
+    CHECK_EQ(CELL_PAD_CTRL_CIRCLE, st.digital2);
 
     /* All four together. */
     make_full_report(report, SWPRO_BTN_A | SWPRO_BTN_B | SWPRO_BTN_X | SWPRO_BTN_Y,
