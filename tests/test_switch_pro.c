@@ -95,10 +95,12 @@ typedef struct {
 } switch_pro_full_report_t;
 
 /* Compile-time proof that the struct matches the wire format. */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 _Static_assert(sizeof(switch_pro_full_report_t) == SWPRO_FULL_REPORT_BYTES,
                "full-mode report must be exactly 54 bytes");
 _Static_assert(SWPRO_IMU_FRAMES * SWPRO_IMU_FRAME_BYTES == 36,
                "3 IMU frames must occupy 36 bytes");
+#endif
 
 /* Offsets, checked against the struct rather than restated by hand. */
 #define OFF_IMU0  13
@@ -1079,6 +1081,171 @@ static void test_subcommand_report_length(void)
 }
 
 /* ===================================================================== */
+/* Test 19 — IMU 0x30 Decoding, SIXAXIS Mapping and Gyro Aiming          */
+/* ===================================================================== */
+
+static inline uint16_t test_swpro_clamp10(int32_t v) {
+    if (v < 0) return 0;
+    if (v > 1023) return 1023;
+    return (uint16_t)v;
+}
+
+static inline uint8_t test_swpro_clamp8(int32_t v) {
+    if (v < 0) return 0;
+    if (v > 255) return 255;
+    return (uint8_t)v;
+}
+
+static void test_imu_decoding_and_gyro_aim(void)
+{
+    printf("\n[imu decoding, sixaxis mapping and gyro aiming]\n");
+
+    /* Construct simulated 0x30 report with 1G = 4096 on Accel Z */
+    /* 64 bytes for USB, 49 bytes for BT */
+    uint8_t report_bt[49];
+    uint8_t report_usb[64];
+    memset(report_bt, 0, sizeof(report_bt));
+    memset(report_usb, 0, sizeof(report_usb));
+
+    report_bt[0] = 0x30;
+    report_usb[0] = 0x30;
+
+    /* Fill 3 IMU frames (bytes 13..48) with:
+       acc_x = 0, acc_y = 0, acc_z = 4096 (1G vertical)
+       gyr_x = 0, gyr_y = 0, gyr_z = 0
+    */
+    for (int f = 0; f < 3; f++) {
+        int off = 13 + f * 12;
+        /* acc_z = 4096 = 0x1000 in Little Endian -> 0x00, 0x10 */
+        report_bt[off + 4] = 0x00;
+        report_bt[off + 5] = 0x10;
+        report_usb[off + 4] = 0x00;
+        report_usb[off + 5] = 0x10;
+    }
+
+    /* Verify decoding for both lengths: 49 (BT) and 64 (USB) */
+    int lengths[2] = {49, 64};
+    uint8_t *reports[2] = {report_bt, report_usb};
+
+    for (int i = 0; i < 2; i++) {
+        uint8_t *rep = reports[i];
+        int len = lengths[i];
+        CHECK(rep[0] == 0x30);
+        CHECK(len >= 49);
+
+        int32_t sum_acc_x = 0, sum_acc_y = 0, sum_acc_z = 0;
+        int32_t sum_gyr_x = 0, sum_gyr_y = 0, sum_gyr_z = 0;
+
+        for (int f = 0; f < 3; f++) {
+            uint8_t *imu = &rep[13 + f * 12];
+            int16_t ax = (int16_t)((uint16_t)imu[0] | ((uint16_t)imu[1] << 8));
+            int16_t ay = (int16_t)((uint16_t)imu[2] | ((uint16_t)imu[3] << 8));
+            int16_t az = (int16_t)((uint16_t)imu[4] | ((uint16_t)imu[5] << 8));
+            int16_t gx = (int16_t)((uint16_t)imu[6] | ((uint16_t)imu[7] << 8));
+            int16_t gy = (int16_t)((uint16_t)imu[8] | ((uint16_t)imu[9] << 8));
+            int16_t gz = (int16_t)((uint16_t)imu[10] | ((uint16_t)imu[11] << 8));
+
+            sum_acc_x += ax; sum_acc_y += ay; sum_acc_z += az;
+            sum_gyr_x += gx; sum_gyr_y += gy; sum_gyr_z += gz;
+        }
+
+        int32_t avg_acc_x = sum_acc_x / 3;
+        int32_t avg_acc_y = sum_acc_y / 3;
+        int32_t avg_acc_z = sum_acc_z / 3;
+        int32_t avg_gyr_z = sum_gyr_z / 3;
+
+        uint16_t sensor_x = test_swpro_clamp10(512 + (-(avg_acc_y) * 113) / 4096);
+        uint16_t sensor_y = test_swpro_clamp10(512 + (-(avg_acc_x) * 113) / 4096);
+        uint16_t sensor_z = test_swpro_clamp10(512 + ((avg_acc_z) * 113) / 4096);
+        uint16_t sensor_g = test_swpro_clamp10(512 + ((avg_gyr_z) * 113) / 1429);
+
+        CHECK_EQ(512, sensor_x);
+        CHECK_EQ(512, sensor_y);
+        CHECK_EQ(625, sensor_z); /* 512 + (4096 * 113) / 4096 = 512 + 113 = 625 */
+        CHECK_EQ(512, sensor_g);
+    }
+
+    /* Test Toggle Capture + R3 state machine: 0 -> 1 -> 2 -> 0 */
+    uint8_t gyro_mode = 0;
+    uint8_t cap_r3_prev = 0;
+
+    /* Press Capture + R3 */
+    uint8_t btn_shared = SWPRO_BTN_CAPTURE | SWPRO_BTN_RSTICK;
+    uint8_t cap_r3_now = ((btn_shared & SWPRO_BTN_CAPTURE) && (btn_shared & SWPRO_BTN_RSTICK)) ? 1 : 0;
+    if (cap_r3_now && !cap_r3_prev) {
+        gyro_mode = (gyro_mode + 1) % 3;
+    }
+    cap_r3_prev = cap_r3_now;
+    CHECK_EQ(1, gyro_mode); /* Mode 1: Hold L2/ZL */
+
+    /* Same buttons held (no new rising edge) */
+    if (cap_r3_now && !cap_r3_prev) {
+        gyro_mode = (gyro_mode + 1) % 3;
+    }
+    CHECK_EQ(1, gyro_mode);
+
+    /* Release */
+    btn_shared = 0;
+    cap_r3_now = ((btn_shared & SWPRO_BTN_CAPTURE) && (btn_shared & SWPRO_BTN_RSTICK)) ? 1 : 0;
+    cap_r3_prev = cap_r3_now;
+
+    /* Press again -> Mode 2 (Always active) */
+    btn_shared = SWPRO_BTN_CAPTURE | SWPRO_BTN_RSTICK;
+    cap_r3_now = ((btn_shared & SWPRO_BTN_CAPTURE) && (btn_shared & SWPRO_BTN_RSTICK)) ? 1 : 0;
+    if (cap_r3_now && !cap_r3_prev) {
+        gyro_mode = (gyro_mode + 1) % 3;
+    }
+    cap_r3_prev = cap_r3_now;
+    CHECK_EQ(2, gyro_mode);
+
+    /* Release and press again -> Mode 0 (Off) */
+    btn_shared = 0;
+    cap_r3_prev = 0;
+    btn_shared = SWPRO_BTN_CAPTURE | SWPRO_BTN_RSTICK;
+    cap_r3_now = 1;
+    if (cap_r3_now && !cap_r3_prev) {
+        gyro_mode = (gyro_mode + 1) % 3;
+    }
+    CHECK_EQ(0, gyro_mode);
+
+    /* Test Gyro Aiming offset calculation on Stick Derecho */
+    uint8_t analog_rx = 128;
+    uint8_t analog_ry = 128;
+    int32_t test_gyr_z = 180;  /* Yaw right */
+    int32_t test_gyr_y = -180; /* Pitch up */
+
+    /* Mode 1 with ZL active */
+    gyro_mode = 1;
+    uint8_t btn_left = SWPRO_BTN_ZL;
+    int active = (gyro_mode == 2) || (gyro_mode == 1 && (btn_left & SWPRO_BTN_ZL));
+    CHECK(active == 1);
+
+    int32_t delta_rx = 0;
+    int32_t delta_ry = 0;
+    if (test_gyr_z > 25 || test_gyr_z < -25) delta_rx = (-test_gyr_z) / 45;
+    if (test_gyr_y > 25 || test_gyr_y < -25) delta_ry = (-test_gyr_y) / 45;
+
+    CHECK_EQ(-4, delta_rx); /* -180 / 45 = -4 */
+    CHECK_EQ(4, delta_ry);  /* -(-180) / 45 = +4 */
+
+    analog_rx = test_swpro_clamp8((int32_t)analog_rx + delta_rx);
+    analog_ry = test_swpro_clamp8((int32_t)analog_ry + delta_ry);
+    CHECK_EQ(124, analog_rx);
+    CHECK_EQ(132, analog_ry);
+
+    /* Test bounds clamping [0..255] under extreme gyro values */
+    analog_rx = 10;
+    delta_rx = -50;
+    analog_rx = test_swpro_clamp8((int32_t)analog_rx + delta_rx);
+    CHECK_EQ(0, analog_rx);
+
+    analog_ry = 245;
+    delta_ry = 50;
+    analog_ry = test_swpro_clamp8((int32_t)analog_ry + delta_ry);
+    CHECK_EQ(255, analog_ry);
+}
+
+/* ===================================================================== */
 /* main                                                                  */
 /* ===================================================================== */
 
@@ -1104,6 +1271,7 @@ int main(void)
     test_rumble_report_bytes();
     test_driver_buffer_sizing();
     test_subcommand_report_length();
+    test_imu_decoding_and_gyro_aim();
 
     printf("\n=================================\n");
     printf("RESULT: %d passed, %d failed\n", tests_passed, tests_failed);

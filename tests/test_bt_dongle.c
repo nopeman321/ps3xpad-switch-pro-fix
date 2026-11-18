@@ -198,6 +198,57 @@ static void test_acl_in_report_stripping(void) {
   simulated_swpro_read_report(0, delivered_report, delivered_len);
 }
 
+/* ------------------------------------------------------------------------- */
+/* 4. Test IMU Data Delivery in BT 0x30 Report (49 bytes payload)            */
+/* ------------------------------------------------------------------------- */
+static void test_acl_in_imu_delivery(void) {
+  printf("[4] Testing IMU data delivery inside 49-byte Bluetooth 0x30 report...\n");
+
+  uint8_t bt_0x30_report[49];
+  memset(bt_0x30_report, 0, sizeof(bt_0x30_report));
+  bt_0x30_report[0] = 0x30;
+  bt_0x30_report[1] = 0x88; /* Timer */
+
+  /* Set 1G (4096 = 0x1000) on Accel Z across 3 frames (offsets 13, 25, 37) */
+  for (int f = 0; f < 3; f++) {
+    int off = 13 + f * 12;
+    bt_0x30_report[off + 4] = 0x00;
+    bt_0x30_report[off + 5] = 0x10;
+  }
+
+  /* Wrap in ACL + L2CAP packet: L2CAP len = 50 (1 byte 0xA1 + 49 bytes payload) */
+  uint8_t acl_in[70];
+  uint16_t l2cap_len = 50;
+  uint16_t acl_len = l2cap_len + 4; /* 54 */
+
+  acl_in[0] = 0x42; acl_in[1] = 0x20;
+  acl_in[2] = acl_len & 0xFF; acl_in[3] = (acl_len >> 8) & 0xFF;
+  acl_in[4] = l2cap_len & 0xFF; acl_in[5] = (l2cap_len >> 8) & 0xFF;
+  acl_in[6] = 0x41; acl_in[7] = 0x00; /* Local CID 0x0041 */
+  acl_in[8] = BT_HID_HDR_DATA_INPUT;  /* 0xA1 */
+  memcpy(&acl_in[9], bt_0x30_report, 49);
+
+  /* Parser extracts payload */
+  const uint8_t *rep = &acl_in[9];
+  int32_t rlen = (acl_in[4] | (acl_in[5] << 8)) - 1;
+
+  CHECK(rlen == 49, "Bluetooth 0x30 report stripped length is 49 bytes");
+  CHECK(rep[0] == 0x30, "Report ID is 0x30");
+
+  /* Verify IMU sample extraction */
+  int32_t sum_acc_z = 0;
+  for (int f = 0; f < 3; f++) {
+    const uint8_t *imu = &rep[13 + f * 12];
+    int16_t az = (int16_t)((uint16_t)imu[4] | ((uint16_t)imu[5] << 8));
+    sum_acc_z += az;
+  }
+  int32_t avg_acc_z = sum_acc_z / 3;
+  CHECK(avg_acc_z == 4096, "IMU Accel Z correctly averages to 4096 (1G)");
+
+  int32_t sensor_z = 512 + ((avg_acc_z) * 113) / 4096;
+  CHECK(sensor_z == 625, "SENSOR_Z matches PS3 SIXAXIS 1G calibration (625)");
+}
+
 int main(void) {
   printf("====================================================\n");
   printf(" ps3xpad Bluetooth Transport & Packet Unit Tests    \n");
@@ -206,6 +257,7 @@ int main(void) {
   test_hci_create_connection();
   test_acl_l2cap_output_packaging();
   test_acl_in_report_stripping();
+  test_acl_in_imu_delivery();
 
   printf("====================================================\n");
   printf(" RESULTS: %d/%d assertions passed successfully!\n", tests_passed, tests_run);

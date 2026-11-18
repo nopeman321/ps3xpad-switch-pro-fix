@@ -448,6 +448,11 @@ typedef struct xpad_unit {
   uint8_t swpro_state;
   int32_t swpro_timer;
   uint32_t swpro_keepalive_timer;
+  uint8_t swpro_gyro_mode;     /* 0 = SIXAXIS only, 1 = Gyro Aim on L2/ZL, 2 = Gyro Aim Always */
+  uint8_t swpro_cap_r3_prev;   /* Edge detector for Capture + R3 toggle */
+  int16_t swpro_gyr_bias_x;    /* Auto-calibration resting bias X */
+  int16_t swpro_gyr_bias_y;    /* Auto-calibration resting bias Y */
+  int16_t swpro_gyr_bias_z;    /* Auto-calibration resting bias Z */
 
   /* Buffer for interrupt transfer */
   unsigned char data[0];
@@ -502,7 +507,7 @@ static int32_t swpro_attach(int32_t dev_id);
 static int32_t swpro_detach(int32_t dev_id);
 static int32_t swpro_detach_all(void);
 static int32_t swpro_read_input(XPAD_UNIT_t *unit, void *data);
-static void swpro_read_report(int32_t id, uint8_t *readBuf);
+static void swpro_read_report(XPAD_UNIT_t *unit, int32_t id, uint8_t *readBuf, int32_t len);
 static int32_t swpro_set_led(XPAD_UNIT_t *unit, uint8_t led);
 static int32_t swpro_set_rumble(XPAD_UNIT_t *unit, uint8_t lval, uint8_t rval);
 static int32_t swpro_send_subcommand(XPAD_UNIT_t *unit, uint8_t subcmd, uint8_t arg);
@@ -2953,6 +2958,18 @@ static int32_t swpro_detach_all(void) {
 #define SWPRO_BTN_HOME    (1 << 4)
 #define SWPRO_BTN_CAPTURE (1 << 5)
 
+static inline uint16_t swpro_clamp10(int32_t v) {
+  if (v < 0) return 0;
+  if (v > 1023) return 1023;
+  return (uint16_t)v;
+}
+
+static inline uint8_t swpro_clamp8(int32_t v) {
+  if (v < 0) return 0;
+  if (v > 255) return 255;
+  return (uint8_t)v;
+}
+
 static uint8_t swpro_scale_axis_12bit(uint16_t raw, int invert) {
   int32_t d = (int32_t)raw - 2048;
   int32_t v;
@@ -2969,7 +2986,7 @@ static uint8_t swpro_scale_axis_12bit(uint16_t raw, int invert) {
 }
 
 // Translate one Switch Pro input report into a libpad data block.
-static void swpro_read_report(int32_t id, uint8_t *readBuf) {
+static void swpro_read_report(XPAD_UNIT_t *unit, int32_t id, uint8_t *readBuf, int32_t len) {
   uint16_t *digit0, *digit1, *digit2,
            *analog_rx, *analog_ry, *analog_lx, *analog_ly,
            *press_l2, *press_r2, *press_l1, *press_r1,
@@ -3021,6 +3038,22 @@ static void swpro_read_report(int32_t id, uint8_t *readBuf) {
     uint8_t btn_right  = readBuf[3];
     uint8_t btn_shared = readBuf[4];
     uint8_t btn_left   = readBuf[5];
+
+    // Toggle Gyro Aiming mode on Capture + R3 rising edge
+    if (unit != NULL) {
+      uint8_t cap_r3_now = ((btn_shared & SWPRO_BTN_CAPTURE) && (btn_shared & SWPRO_BTN_RSTICK)) ? 1 : 0;
+      if (cap_r3_now && !unit->swpro_cap_r3_prev) {
+        unit->swpro_gyro_mode = (unit->swpro_gyro_mode + 1) % 3;
+        if (unit->swpro_gyro_mode == 0) {
+          show_msg((char *)"XPAD: Gyro Aim -> OFF (SIXAXIS Native Only)");
+        } else if (unit->swpro_gyro_mode == 1) {
+          show_msg((char *)"XPAD: Gyro Aim -> ON (Hold L2/ZL)");
+        } else {
+          show_msg((char *)"XPAD: Gyro Aim -> ON (Always Active)");
+        }
+      }
+      unit->swpro_cap_r3_prev = cap_r3_now;
+    }
 
     uint16_t lx_12 = (uint16_t)readBuf[6] | ((uint16_t)(readBuf[7] & 0x0F) << 8);
     uint16_t ly_12 = (uint16_t)(readBuf[7] >> 4) | ((uint16_t)readBuf[8] << 4);
@@ -3074,6 +3107,67 @@ static void swpro_read_report(int32_t id, uint8_t *readBuf) {
     *press_cross = (btn_right & SWPRO_BTN_B) ? 0xFF : 0;
     *press_circle = (btn_right & SWPRO_BTN_A) ? 0xFF : 0;
 
+    // Decode 36 bytes of IMU data (3 frames of 12 bytes each: offsets 13, 25, 37)
+    if (readBuf[0] == SWPRO_IN_FULL && len >= 49) {
+      int32_t sum_acc_x = 0, sum_acc_y = 0, sum_acc_z = 0;
+      int32_t sum_gyr_x = 0, sum_gyr_y = 0, sum_gyr_z = 0;
+      int f;
+
+      for (f = 0; f < 3; f++) {
+        uint8_t *imu = &readBuf[13 + f * 12];
+        int16_t ax = (int16_t)((uint16_t)imu[0] | ((uint16_t)imu[1] << 8));
+        int16_t ay = (int16_t)((uint16_t)imu[2] | ((uint16_t)imu[3] << 8));
+        int16_t az = (int16_t)((uint16_t)imu[4] | ((uint16_t)imu[5] << 8));
+        int16_t gx = (int16_t)((uint16_t)imu[6] | ((uint16_t)imu[7] << 8));
+        int16_t gy = (int16_t)((uint16_t)imu[8] | ((uint16_t)imu[9] << 8));
+        int16_t gz = (int16_t)((uint16_t)imu[10] | ((uint16_t)imu[11] << 8));
+
+        sum_acc_x += ax;
+        sum_acc_y += ay;
+        sum_acc_z += az;
+        sum_gyr_x += gx;
+        sum_gyr_y += gy;
+        sum_gyr_z += gz;
+      }
+
+      int32_t avg_acc_x = sum_acc_x / 3;
+      int32_t avg_acc_y = sum_acc_y / 3;
+      int32_t avg_acc_z = sum_acc_z / 3;
+      int32_t avg_gyr_x = sum_gyr_x / 3;
+      int32_t avg_gyr_y = sum_gyr_y / 3;
+      int32_t avg_gyr_z = sum_gyr_z / 3;
+      (void)avg_gyr_x;
+
+      // Mode A: Native PS3 SIXAXIS sensor channels (0..1023, center 512 = 0x0200)
+      data.button[CELL_PAD_BTN_OFFSET_SENSOR_X] = swpro_clamp10(512 + (-(avg_acc_y) * 113) / 4096);
+      data.button[CELL_PAD_BTN_OFFSET_SENSOR_Y] = swpro_clamp10(512 + (-(avg_acc_x) * 113) / 4096);
+      data.button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = swpro_clamp10(512 + ((avg_acc_z) * 113) / 4096);
+      data.button[CELL_PAD_BTN_OFFSET_SENSOR_G] = swpro_clamp10(512 + ((avg_gyr_z) * 113) / 1429);
+
+      // Mode B: Gyro-to-Right-Stick Aiming
+      if (unit != NULL) {
+        int gyro_aim_active = (unit->swpro_gyro_mode == 2) ||
+                              (unit->swpro_gyro_mode == 1 && (btn_left & SWPRO_BTN_ZL));
+        if (gyro_aim_active) {
+          int32_t delta_rx = 0;
+          int32_t delta_ry = 0;
+
+          // Anti-drift deadzone (~25 LSB)
+          if (avg_gyr_z > 25 || avg_gyr_z < -25) {
+            delta_rx = (-avg_gyr_z) / 45;
+          }
+          if (avg_gyr_y > 25 || avg_gyr_y < -25) {
+            delta_ry = (-avg_gyr_y) / 45;
+          }
+
+          if (delta_rx != 0 || delta_ry != 0) {
+            *analog_rx = swpro_clamp8((int32_t)(*analog_rx) + delta_rx);
+            *analog_ry = swpro_clamp8((int32_t)(*analog_ry) + delta_ry);
+          }
+        }
+      }
+    }
+
   } else if (readBuf[0] == SWPRO_IN_SIMPLE) {
     // 0x3F simple HID report: readBuf[1..2] buttons, readBuf[3] hat, readBuf[4..11] 4 axes 16-bit LE
     uint16_t b = (uint16_t)readBuf[1] | ((uint16_t)readBuf[2] << 8);
@@ -3119,6 +3213,7 @@ static int32_t swpro_read_input(XPAD_UNIT_t *unit, void *data) {
   int32_t have_report = 0;
   uint8_t first_report = 0;
   int32_t len;
+  int32_t last_len = 0;
 
   p = (unsigned char *)data;
   if (unit == NULL) {
@@ -3130,13 +3225,14 @@ static int32_t swpro_read_input(XPAD_UNIT_t *unit, void *data) {
   while (unit->rblen > 0) {
     xpadbuf = &unit->ringbuf[unit->rp][0];
     len = xpadbuf[1];
-    if (len >= 3 && (xpadbuf[2] == SWPRO_IN_FULL || xpadbuf[2] == SWPRO_IN_SUBCMD_REPLY || xpadbuf[2] == SWPRO_IN_SIMPLE)) {
+    if (len >= 12 && (xpadbuf[2] == SWPRO_IN_FULL || xpadbuf[2] == SWPRO_IN_SUBCMD_REPLY || xpadbuf[2] == SWPRO_IN_SIMPLE)) {
       if (len > MAX_XPAD_DATA_LEN - 2) {
         len = MAX_XPAD_DATA_LEN - 2;
       }
       memcpy(p, &xpadbuf[2], len);
       have_report = 1;
       first_report = xpadbuf[2];
+      last_len = len;
     }
     if (++unit->rp >= RINGBUF_SIZE) {
       unit->rp = 0;
@@ -3146,7 +3242,7 @@ static int32_t swpro_read_input(XPAD_UNIT_t *unit, void *data) {
   unblock(unit->rb_mutex);
 
   if (have_report && unit->number >= 0 && handle[unit->number] >= 0) {
-    swpro_read_report(unit->number, p);
+    swpro_read_report(unit, unit->number, p, last_len);
     (void)first_report;
   }
   return(0);
@@ -3316,6 +3412,7 @@ static int32_t check_pad_status(void) {
           port = cellPadLddGetPortNo(handle[unit->number]);
           if (port >= 0 && port != unit->last_port) {
             unit->last_port = port;
+            cellPadSetPortSetting(port, CELL_PAD_SETTING_PRESS_ON | CELL_PAD_SETTING_SENSOR_ON);
             unit->set_led(unit, xpad_led[port%4]);
           }
         }
