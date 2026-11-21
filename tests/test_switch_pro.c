@@ -21,6 +21,11 @@
 #include <stdio.h>
 #include <string.h>
 
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define __builtin_popcount __popcnt
+#endif
+
 /* ===================================================================== */
 /* Protocol constants                                                    */
 /* ===================================================================== */
@@ -1042,7 +1047,7 @@ static void test_subcommand_report_length(void)
      * the init sequence sends must fit in that frame: id, counter, 8 rumble
      * bytes, subcommand code, argument.
      */
-    const int SWPRO_OUT_REPORT_LEN = 16;
+    enum { SWPRO_OUT_REPORT_LEN = 16 };
     uint8_t out[SWPRO_OUT_REPORT_LEN];
 
     /* Subcommands used by swpro_init(), in order. */

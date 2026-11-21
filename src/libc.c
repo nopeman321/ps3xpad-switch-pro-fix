@@ -58,9 +58,14 @@ char *strchr(const char *s, int c)
 char *strstr(const char *s1, const char *s2)
 {
     size_t n = strlen(s2);
-    while(*s1)
-        if(!memcmp(s1++,s2,n))
-            return s1-1;
+    if (n == 0) return (char *)s1;
+    while (*s1) {
+        // Ensure there are at least n characters left in s1
+        if (strlen(s1) < n) break;
+        if (strncmp(s1, s2, n) == 0)
+            return (char *)s1;
+        s1++;
+    }
     return 0;
 }
 
@@ -91,39 +96,34 @@ int strncasecmp (__const char *s1, __const char *s2, size_t n)
 
 int strcasecmp (__const char *s1, __const char *s2)
 {
-  int c1, c2, n;
-  n=strlen(s1);
-  while (n > 0)
+    int c1, c2;
+    while (*s1 && *s2)
     {
-      c1 = *((unsigned char *)(s1++));
-      if (c1 >= 'A' && c1 <= 'Z')
-        c1 = c1 + ('a' - 'A');
-      c2 = *((unsigned char *)(s2++));
-      if (c2 >= 'A' && c2 <= 'Z')
-        c2 = c2 + ('a' - 'A');
-      if (c1 != c2)
-        {
-          return (c1 - c2);
-        }
-      if (c1 == '\0')
-        {
-          return 0;
-        }
-      --n;
+        c1 = *((unsigned char *)s1);
+        c2 = *((unsigned char *)s2);
+        if (c1 >= 'A' && c1 <= 'Z') c1 = c1 + ('a' - 'A');
+        if (c2 >= 'A' && c2 <= 'Z') c2 = c2 + ('a' - 'A');
+        if (c1 != c2)
+            return c1 - c2;
+        s1++; s2++;
     }
-  return 0;
+    // One or both strings ended
+    c1 = *s1 ? *((unsigned char *)s1) : 0;
+    c2 = *s2 ? *((unsigned char *)s2) : 0;
+    if (c1 >= 'A' && c1 <= 'Z') c1 = c1 + ('a' - 'A');
+    if (c2 >= 'A' && c2 <= 'Z') c2 = c2 + ('a' - 'A');
+    return c1 - c2;
 }
 
 int strncmp(const char* s1, const char* s2, size_t n)
 {
-	if(n==0) return 0;
-    while(*s1 && (*s1==*s2))
-	{
-        s1++,s2++;
-		n--;
-		if(n==0) break;
-	}
-    return *(const unsigned char*)s1-*(const unsigned char*)s2;
+    if (n == 0) return 0;
+    while (n && *s1 && *s2 && (*s1 == *s2))
+    {
+        s1++; s2++; n--;
+    }
+    if (n == 0) return 0;
+    return (unsigned char)*s1 - (unsigned char)*s2;
 }
 
 int strcmp(const char* s1, const char* s2)
@@ -165,19 +165,35 @@ char *strcat(char *dest, const char *src)
     return ret;
 }
 
-char *strtok(char * str, const char * delim)
+char *strtok_r(char *str, const char *delim, char **saveptr)
 {
-    static char* p=0;
-    if(str)
-        p=str;
-    else if(!p)
-        return 0;
-    str=p+strspn(p,delim);
-    p=str+strcspn(str,delim);
-    if(p==str)
-        return p=0;
-    p = *p ? *p=0,p+1 : 0;
+    // If str is NULL, continue from saved pointer
+    if (str == NULL) {
+        str = *saveptr;
+        if (str == NULL) return NULL;
+    }
+    // Skip leading delimiters
+    str += strspn(str, delim);
+    if (*str == '\0') {
+        *saveptr = NULL;
+        return NULL;
+    }
+    // Find end of token
+    char *end = str + strcspn(str, delim);
+    if (*end != '\0') {
+        *end = '\0';
+        *saveptr = end + 1;
+    } else {
+        *saveptr = NULL;
+    }
     return str;
+}
+
+/* Existing non-reentrant strtok kept for compatibility, but now forwards to strtok_r */
+char *strtok(char *str, const char *delim)
+{
+    static char *p = NULL;
+    return strtok_r(str, delim, &p);
 }
 
 size_t strcspn(const char *s1, const char *s2)

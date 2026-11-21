@@ -8,6 +8,9 @@ tests/test_switch_pro
 tests/test_switch_pro.exe
 tests/test_bt_dongle
 tests/test_bt_dongle.exe
+tests/test_hen_integration
+tests/test_hen_integration.exe
+*.obj
 *.o
 *.d
 *.sym

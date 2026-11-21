@@ -35,6 +35,9 @@ SYS_MODULE_STOP(xpad_game_stop);
 int xpad_game_start(uint64_t arg);
 int xpad_game_stop(void);
 
+// Proper prototype for lv2 IPC event port connection to prevent implicit declaration
+int32_t sys_event_port_connect_ipc(sys_event_port_t event_port_id, uint64_t ipc_key);
+
 // ---------------------------------------------------------------------------
 // Rumble IPC sender (game process -> VSH driver)
 // ---------------------------------------------------------------------------
@@ -165,15 +168,22 @@ static uint32_t  g_tramp[16];           // set orig TOC, replay prologue, jump b
 static uint32_t  g_orig_opd[2] __attribute__((aligned(8))); // {g_tramp, orig TOC}
 static int32_t   g_hook_installed;
 
-// emit a 4-instruction absolute jump to 'addr' using the volatile r0:
-//   lis r0,addr@h ; ori r0,r0,addr@l ; mtctr r0 ; bctr
-// r0 is scratch under the PPC64 ABI so this is safe at a function entry. Valid
-// for PS3 user addresses (< 0x8000_0000, so lis does not sign-extend high).
-static void emit_jump_r0(uint32_t *out, uint32_t addr) {
-  out[0] = 0x3C000000u | (addr >> 16);    // lis   r0, addr@h
-  out[1] = 0x60000000u | (addr & 0xFFFF); // ori   r0, r0, addr@l
-  out[2] = 0x7C0903A6u;                   // mtctr r0
+// emit a 4-instruction absolute jump to 'addr' using the volatile r11:
+//   lis r11,addr@h ; ori r11,r11,addr@l ; mtctr r11 ; bctr
+// r11 is a standard volatile scratch/trampoline register under the PPC64 ELF ABI.
+// Using r11 instead of r0 avoids clobbering r0, which standard PPC64 prologues
+// use to hold the link register (mflr r0; std r0, 16(r1)) before saving it to stack.
+// Valid for PS3 user addresses (< 0x8000_0000, so lis does not sign-extend high).
+static void emit_jump_r11(uint32_t *out, uint32_t addr) {
+  out[0] = 0x3D600000u | (addr >> 16);    // lis   r11, addr@h
+  out[1] = 0x616B0000u | (addr & 0xFFFF); // ori   r11, r11, addr@l
+  out[2] = 0x7D6903A6u;                   // mtctr r11
   out[3] = 0x4E800420u;                   // bctr
+}
+
+// Backward-compatible alias for emit_jump_r0
+static inline void emit_jump_r0(uint32_t *out, uint32_t addr) {
+  emit_jump_r11(out, addr);
 }
 
 // emit lis/ori loading 'val' into r2 (the TOC pointer) at out[0..1]
@@ -234,13 +244,13 @@ static int32_t install_hook(void) {
 
   // thunk: land here from the patched entry, set our TOC, jump to the C hook
   emit_load_r2(g_thunk, our_toc);
-  emit_jump_r0(g_thunk + 2, hook_entry);
+  emit_jump_r11(g_thunk + 2, hook_entry);
 
   // trampoline (the "original"): set the original TOC, replay the displaced
   // prologue, then jump back into the function just past the patch
   emit_load_r2(g_tramp, orig_toc);
   memcpy(g_tramp + 2, g_saved, sizeof(g_saved));
-  emit_jump_r0(g_tramp + 2 + STEAL, (uint32_t)(uintptr_t)(g_target + STEAL));
+  emit_jump_r11(g_tramp + 2 + STEAL, (uint32_t)(uintptr_t)(g_target + STEAL));
   g_orig_opd[0] = (uint32_t)(uintptr_t)g_tramp;
   g_orig_opd[1] = orig_toc;
 
@@ -254,7 +264,7 @@ static int32_t install_hook(void) {
   // itself was injected the same way) this takes effect immediately.
   {
     uint32_t patch[STEAL];
-    emit_jump_r0(patch, (uint32_t)(uintptr_t)g_thunk);
+    emit_jump_r11(patch, (uint32_t)(uintptr_t)g_thunk);
     memcpy(g_target, patch, sizeof(patch));
     icache_flush(g_target, sizeof(patch));
   }

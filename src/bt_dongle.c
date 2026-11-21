@@ -111,6 +111,13 @@ typedef struct {
 
 static btd_context_t btd;
 
+/* Realtek firmware download state */
+static int32_t s_rtl_fd = -1;
+static uint32_t s_rtl_fw_rem = 0;
+static uint32_t s_rtl_frag_total = 0;
+static uint32_t s_rtl_frag_curr = 0;
+static uint8_t s_rtl_j = 0;
+
 /* Default MAC from captured log (Little-Endian: 28 E1 F7 D8 17 E4 = E4:17:D8:F7:E1:28) */
 static const uint8_t s_default_target_mac[6] = {0x28, 0xE1, 0xF7, 0xD8, 0x17, 0xE4};
 
@@ -317,6 +324,15 @@ static void btd_set_config_done(int32_t result, int32_t count, void *arg) {
 int32_t btd_detach(int32_t dev_id) {
   btd.closing = 1;
 
+  if (s_rtl_fd >= 0) {
+    cellFsClose(s_rtl_fd);
+    s_rtl_fd = -1;
+  }
+  s_rtl_fw_rem = 0;
+  s_rtl_frag_total = 0;
+  s_rtl_frag_curr = 0;
+  s_rtl_j = 0;
+
   if (btd.swpro_unit != NULL) {
     btd_destroy_switch_unit(btd.swpro_unit);
     btd.swpro_unit = NULL;
@@ -409,12 +425,6 @@ static void btd_process_cmd_queue(void) {
 }
 
 #define RTL_FRAG_LEN 252
-
-static int32_t s_rtl_fd = -1;
-static uint32_t s_rtl_fw_rem = 0;
-static uint32_t s_rtl_frag_total = 0;
-static uint32_t s_rtl_frag_curr = 0;
-static uint8_t s_rtl_j = 0;
 
 static void btd_rtl_send_next_chunk(void) {
   if (s_rtl_fd < 0) return;
@@ -605,12 +615,14 @@ static void btd_evt_done(int32_t result, int32_t count, void *arg) {
       }
 
       case HCI_EVT_CONN_REQUEST: {
-        /* Incoming connection request from gamepad */
-        uint8_t accept_params[7];
-        memcpy(&accept_params[0], &p[0], 6);
-        accept_params[6] = 0x00; /* Remain Master */
-        btd_queue_cmd(HCI_OP_ACCEPT_CONN_REQ, 7, accept_params);
-        xlog("BTD: Incoming connection request accepted");
+        if (count >= 8) {
+          /* Incoming connection request from gamepad */
+          uint8_t accept_params[7];
+          memcpy(&accept_params[0], &p[0], 6);
+          accept_params[6] = 0x00; /* Remain Master */
+          btd_queue_cmd(HCI_OP_ACCEPT_CONN_REQ, 7, accept_params);
+          xlog("BTD: Incoming connection request accepted");
+        }
         break;
       }
 
@@ -658,27 +670,35 @@ static void btd_evt_done(int32_t result, int32_t count, void *arg) {
       }
 
       case HCI_EVT_LINK_KEY_REQ: {
-        btd_queue_cmd(HCI_OP_LINK_KEY_NEG_REPLY, 6, &p[0]);
+        if (count >= 8) {
+          btd_queue_cmd(HCI_OP_LINK_KEY_NEG_REPLY, 6, &p[0]);
+        }
         break;
       }
 
       case HCI_EVT_PIN_CODE_REQ: {
-        btd_queue_cmd(HCI_OP_PIN_CODE_NEG_REPLY, 6, &p[0]);
+        if (count >= 8) {
+          btd_queue_cmd(HCI_OP_PIN_CODE_NEG_REPLY, 6, &p[0]);
+        }
         break;
       }
 
       case HCI_EVT_IO_CAP_REQ: {
-        uint8_t io_params[9];
-        memcpy(&io_params[0], &p[0], 6);
-        io_params[6] = 0x03; /* NoInputNoOutput */
-        io_params[7] = 0x00; /* OOB Auth Data Not Present */
-        io_params[8] = 0x00; /* MITM Not Required - General Bonding */
-        btd_queue_cmd(HCI_OP_IO_CAP_REPLY, 9, io_params);
+        if (count >= 8) {
+          uint8_t io_params[9];
+          memcpy(&io_params[0], &p[0], 6);
+          io_params[6] = 0x03; /* NoInputNoOutput */
+          io_params[7] = 0x00; /* OOB Auth Data Not Present */
+          io_params[8] = 0x00; /* MITM Not Required - General Bonding */
+          btd_queue_cmd(HCI_OP_IO_CAP_REPLY, 9, io_params);
+        }
         break;
       }
 
       case HCI_EVT_USER_CONFIRM_REQ: {
-        btd_queue_cmd(HCI_OP_USER_CONFIRM_REPLY, 6, &p[0]);
+        if (count >= 8) {
+          btd_queue_cmd(HCI_OP_USER_CONFIRM_REPLY, 6, &p[0]);
+        }
         break;
       }
 
@@ -696,8 +716,12 @@ static void btd_evt_done(int32_t result, int32_t count, void *arg) {
       case HCI_EVT_INQUIRY_RESULT:
       case HCI_EVT_INQUIRY_RESULT_WITH_RSSI:
       case HCI_EVT_EXT_INQUIRY_RESULT: {
+        if (count < 3) {
+          break;
+        }
         uint8_t num = p[0];
-        if (num > 0) {
+        int32_t min_len = (evt_code == HCI_EVT_INQUIRY_RESULT) ? 15 : 14;
+        if (num > 0 && count >= min_len) {
           uint8_t *bd = &p[1];
           uint32_t cod = 0;
           if (evt_code == HCI_EVT_INQUIRY_RESULT) {
@@ -842,101 +866,103 @@ static void btd_acl_in_done(int32_t result, int32_t count, void *arg) {
 
   if (count >= 8) {
     uint16_t l2cap_len = btd.acl_in_buf[4] | (btd.acl_in_buf[5] << 8);
-    uint16_t cid = btd.acl_in_buf[6] | (btd.acl_in_buf[7] << 8);
-    uint8_t *payload = &btd.acl_in_buf[8];
+    if ((int32_t)count >= 8 + (int32_t)l2cap_len) {
+      uint16_t cid = btd.acl_in_buf[6] | (btd.acl_in_buf[7] << 8);
+      uint8_t *payload = &btd.acl_in_buf[8];
 
-    if (cid == L2CAP_CID_SIGNALING && l2cap_len >= 4) {
-      uint8_t cmd = payload[0];
-      uint8_t ident = payload[1];
-      uint16_t clen = payload[2] | (payload[3] << 8);
-      uint8_t *cdata = &payload[4];
+      if (cid == L2CAP_CID_SIGNALING && l2cap_len >= 4) {
+        uint8_t cmd = payload[0];
+        uint8_t ident = payload[1];
+        uint16_t clen = payload[2] | (payload[3] << 8);
+        uint8_t *cdata = &payload[4];
 
-      if (cmd == L2CAP_CMD_CONN_RSP && clen >= 8) {
-        uint16_t dcid = cdata[0] | (cdata[1] << 8);
-        uint16_t scid = cdata[2] | (cdata[3] << 8);
-        uint16_t res  = cdata[4] | (cdata[5] << 8);
+        if (cmd == L2CAP_CMD_CONN_RSP && clen >= 8) {
+          uint16_t dcid = cdata[0] | (cdata[1] << 8);
+          uint16_t scid = cdata[2] | (cdata[3] << 8);
+          uint16_t res  = cdata[4] | (cdata[5] << 8);
 
-        if (res == L2CAP_CONN_SUCCESS) {
-          if (scid == L2CAP_LOCAL_CID_HID_CTRL) {
-            btd.ctrl_rcid = dcid;
-            btd_send_l2cap_conf_req(dcid);
-            btd.state = BTD_STATE_L2CAP_CONFIG_CTRL;
-          } else if (scid == L2CAP_LOCAL_CID_HID_INTR) {
-            btd.intr_rcid = dcid;
-            btd_send_l2cap_conf_req(dcid);
-            btd.state = BTD_STATE_L2CAP_CONFIG_INTR;
+          if (res == L2CAP_CONN_SUCCESS) {
+            if (scid == L2CAP_LOCAL_CID_HID_CTRL) {
+              btd.ctrl_rcid = dcid;
+              btd_send_l2cap_conf_req(dcid);
+              btd.state = BTD_STATE_L2CAP_CONFIG_CTRL;
+            } else if (scid == L2CAP_LOCAL_CID_HID_INTR) {
+              btd.intr_rcid = dcid;
+              btd_send_l2cap_conf_req(dcid);
+              btd.state = BTD_STATE_L2CAP_CONFIG_INTR;
+            }
           }
-        }
-      } else if (cmd == L2CAP_CMD_CONN_REQ && clen >= 4) {
-        uint16_t psm  = cdata[0] | (cdata[1] << 8);
-        uint16_t scid = cdata[2] | (cdata[3] << 8);
+        } else if (cmd == L2CAP_CMD_CONN_REQ && clen >= 4) {
+          uint16_t psm  = cdata[0] | (cdata[1] << 8);
+          uint16_t scid = cdata[2] | (cdata[3] << 8);
 
-        if (psm == L2CAP_PSM_HID_CTRL) {
-          btd.ctrl_rcid = scid;
-          btd_send_l2cap_conn_rsp(ident, L2CAP_LOCAL_CID_HID_CTRL, scid, L2CAP_CONN_SUCCESS);
-          btd_send_l2cap_conf_req(scid);
-        } else if (psm == L2CAP_PSM_HID_INTR) {
-          btd.intr_rcid = scid;
-          btd_send_l2cap_conn_rsp(ident, L2CAP_LOCAL_CID_HID_INTR, scid, L2CAP_CONN_SUCCESS);
-          btd_send_l2cap_conf_req(scid);
-        }
-      } else if (cmd == L2CAP_CMD_CONF_REQ && clen >= 4) {
-        uint16_t dcid = cdata[0] | (cdata[1] << 8);
-        btd_send_l2cap_conf_rsp(ident, dcid == L2CAP_LOCAL_CID_HID_CTRL ? btd.ctrl_rcid : btd.intr_rcid);
-        if (dcid == L2CAP_LOCAL_CID_HID_CTRL) btd.remote_conf_ctrl = 1;
-        if (dcid == L2CAP_LOCAL_CID_HID_INTR) btd.remote_conf_intr = 1;
-      } else if (cmd == L2CAP_CMD_CONF_RSP && clen >= 6) {
-        uint16_t scid = cdata[0] | (cdata[1] << 8);
-        uint16_t res  = cdata[4] | (cdata[5] << 8);
+          if (psm == L2CAP_PSM_HID_CTRL) {
+            btd.ctrl_rcid = scid;
+            btd_send_l2cap_conn_rsp(ident, L2CAP_LOCAL_CID_HID_CTRL, scid, L2CAP_CONN_SUCCESS);
+            btd_send_l2cap_conf_req(scid);
+          } else if (psm == L2CAP_PSM_HID_INTR) {
+            btd.intr_rcid = scid;
+            btd_send_l2cap_conn_rsp(ident, L2CAP_LOCAL_CID_HID_INTR, scid, L2CAP_CONN_SUCCESS);
+            btd_send_l2cap_conf_req(scid);
+          }
+        } else if (cmd == L2CAP_CMD_CONF_REQ && clen >= 4) {
+          uint16_t dcid = cdata[0] | (cdata[1] << 8);
+          btd_send_l2cap_conf_rsp(ident, dcid == L2CAP_LOCAL_CID_HID_CTRL ? btd.ctrl_rcid : btd.intr_rcid);
+          if (dcid == L2CAP_LOCAL_CID_HID_CTRL) btd.remote_conf_ctrl = 1;
+          if (dcid == L2CAP_LOCAL_CID_HID_INTR) btd.remote_conf_intr = 1;
+        } else if (cmd == L2CAP_CMD_CONF_RSP && clen >= 6) {
+          uint16_t scid = cdata[0] | (cdata[1] << 8);
+          uint16_t res  = cdata[4] | (cdata[5] << 8);
 
-        if (res == L2CAP_CONF_SUCCESS) {
-          if (scid == L2CAP_LOCAL_CID_HID_CTRL) {
-            btd.local_conf_ctrl = 1;
-            /* Control channel configured, now open Interrupt channel */
-            btd_send_l2cap_conn_req(L2CAP_PSM_HID_INTR, L2CAP_LOCAL_CID_HID_INTR);
-            btd.state = BTD_STATE_L2CAP_OPENING_INTR;
-          } else if (scid == L2CAP_LOCAL_CID_HID_INTR) {
-            btd.local_conf_intr = 1;
-            /* Both channels open! Switch Pro Bluetooth is ACTIVE */
-            btd.state = BTD_STATE_HID_ACTIVE;
-            xlog("BTD: HID interrupt channel opened and active!");
+          if (res == L2CAP_CONF_SUCCESS) {
+            if (scid == L2CAP_LOCAL_CID_HID_CTRL) {
+              btd.local_conf_ctrl = 1;
+              /* Control channel configured, now open Interrupt channel */
+              btd_send_l2cap_conn_req(L2CAP_PSM_HID_INTR, L2CAP_LOCAL_CID_HID_INTR);
+              btd.state = BTD_STATE_L2CAP_OPENING_INTR;
+            } else if (scid == L2CAP_LOCAL_CID_HID_INTR) {
+              btd.local_conf_intr = 1;
+              /* Both channels open! Switch Pro Bluetooth is ACTIVE */
+              btd.state = BTD_STATE_HID_ACTIVE;
+              xlog("BTD: HID interrupt channel opened and active!");
 
-            if (btd.swpro_unit == NULL) {
-              btd.swpro_unit = btd_create_switch_unit();
-              if (btd.swpro_unit != NULL) {
-                btd_start_swpro_init(btd.swpro_unit);
+              if (btd.swpro_unit == NULL) {
+                btd.swpro_unit = btd_create_switch_unit();
+                if (btd.swpro_unit != NULL) {
+                  btd_start_swpro_init(btd.swpro_unit);
+                }
               }
             }
           }
         }
-      }
-    } else if ((cid == L2CAP_LOCAL_CID_HID_INTR || cid == btd.intr_rcid) && l2cap_len >= 2) {
-      /* HID Report received over Bluetooth */
-      const uint8_t *rep = NULL;
-      int32_t rlen = 0;
-      if (payload[0] == BT_HID_HDR_DATA_INPUT && l2cap_len > 1) {
-        rep = &payload[1];
-        rlen = l2cap_len - 1;
-      } else if (payload[0] == 0x30 || payload[0] == 0x21 || payload[0] == 0x3F) {
-        rep = &payload[0];
-        rlen = l2cap_len;
-      }
+      } else if ((cid == L2CAP_LOCAL_CID_HID_INTR || cid == btd.intr_rcid) && l2cap_len >= 2) {
+        /* HID Report received over Bluetooth */
+        const uint8_t *rep = NULL;
+        int32_t rlen = 0;
+        if (payload[0] == BT_HID_HDR_DATA_INPUT && l2cap_len > 1) {
+          rep = &payload[1];
+          rlen = l2cap_len - 1;
+        } else if (payload[0] == 0x30 || payload[0] == 0x21 || payload[0] == 0x3F) {
+          rep = &payload[0];
+          rlen = l2cap_len;
+        }
 
-      if (rep != NULL) {
-        static uint32_t s_in_count = 0;
-        if (s_in_count++ == 0 || (s_in_count % 300) == 0) {
-          xlog_code("BTD: HID input report ID", (int32_t)rep[0]);
-          xlog_code("BTD: HID input report len", rlen);
+        if (rep != NULL) {
+          static uint32_t s_in_count = 0;
+          if (s_in_count++ == 0 || (s_in_count % 300) == 0) {
+            xlog_code("BTD: HID input report ID", (int32_t)rep[0]);
+            xlog_code("BTD: HID input report len", rlen);
+          }
+          if (btd.swpro_unit != NULL) {
+            btd_push_report(btd.swpro_unit, rep, rlen);
+          }
         }
-        if (btd.swpro_unit != NULL) {
-          btd_push_report(btd.swpro_unit, rep, rlen);
+      } else {
+        static uint32_t s_other_cid_count = 0;
+        if (s_other_cid_count++ < 3) {
+          xlog_code("BTD: ACL IN other CID", (int32_t)cid);
+          xlog_code("BTD: ACL IN other len", (int32_t)l2cap_len);
         }
-      }
-    } else {
-      static uint32_t s_other_cid_count = 0;
-      if (s_other_cid_count++ < 3) {
-        xlog_code("BTD: ACL IN other CID", (int32_t)cid);
-        xlog_code("BTD: ACL IN other len", (int32_t)l2cap_len);
       }
     }
   }

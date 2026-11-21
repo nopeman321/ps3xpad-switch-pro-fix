@@ -54,8 +54,12 @@
 // means an identical LDD is already registered (duplicate name or VID/PID -
 // e.g. from a partial earlier pass, a duplicate table entry, or another
 // plugin claiming the same device).
+#ifndef CELL_USBD_ERROR_NOT_INITIALIZED
 #define CELL_USBD_ERROR_NOT_INITIALIZED        ((int32_t)0x80110001)
+#endif
+#ifndef CELL_USBD_ERROR_LDD_ALREADY_REGISTERED
 #define CELL_USBD_ERROR_LDD_ALREADY_REGISTERED ((int32_t)0x80110006)
+#endif
 // 0x801100FF is returned by cellUsbdRegisterExtraLdd() once cellUsbd's
 // fixed-size LDD table is full (retail hardware accepts only ~22 entries,
 // shared across every plugin on the system). This built-in device table is
@@ -63,7 +67,13 @@
 // that registered keep working and the plugin stays active - it just cannot
 // claim any further VID/PIDs. The device table is ordered so the controllers
 // people actually use register before the budget runs out (see xpad_info).
+#ifndef CELL_USBD_ERROR_LDD_TABLE_FULL
 #define CELL_USBD_ERROR_LDD_TABLE_FULL         ((int32_t)0x801100FF)
+#endif
+
+#ifndef SYS_PRX_STOP_ERROR
+#define SYS_PRX_STOP_ERROR                     SYS_PRX_STOP_FAILED
+#endif
 
 // Rumble IPC (game process -> this VSH plugin). The key, queue depth and wire
 // format are defined in xpad_rumble.h, shared with the game-side sender so the
@@ -618,7 +628,7 @@ static inline void _sys_ppu_thread_exit(uint64_t val) {
 }
 
 static inline sys_prx_id_t prx_get_module_id_by_address(void *addr) {
-  system_call_1(461, (uint64_t)(uint32_t)addr);
+  system_call_1(461, (uint64_t)(uintptr_t)addr);
   return((int)p1);
 }
 
@@ -627,20 +637,20 @@ static inline sys_prx_id_t prx_get_module_id_by_address(void *addr) {
 static inline uint64_t time_now_usec(void) {
   uint64_t sec = 0, nsec = 0;
 
-  system_call_2(145, (uint64_t)(uint32_t)&sec, (uint64_t)(uint32_t)&nsec);
+  system_call_2(145, (uint64_t)(uintptr_t)&sec, (uint64_t)(uintptr_t)&nsec);
   return(sec * 1000000ULL + nsec / 1000ULL);
 }
 
 static inline void sys_pad_dbg_ldd_register_controller(uint8_t *data, int32_t *handle, uint8_t addr, uint32_t capability) {
 
   // syscall for registering a virtual controller with custom capabilities
-  system_call_4(574, (uint8_t *)data, (int32_t *)handle, (uint8_t)addr, (uint32_t)capability);
+  system_call_4(574, (uint64_t)(uintptr_t)data, (uint64_t)(uintptr_t)handle, (uint64_t)(uint32_t)addr, (uint64_t)(uint32_t)capability);
 }
 
 static inline void sys_pad_dbg_ldd_set_data_insert_mode(int32_t handle, uint16_t addr, uint32_t *mode, uint8_t addr2) {
 
   // syscall for controlling button data filter (allows a virtual controller to be used in games)
-  system_call_4(573, handle, addr, mode, addr2);
+  system_call_4(573, (uint64_t)(uint32_t)handle, (uint64_t)(uint32_t)addr, (uint64_t)(uintptr_t)mode, (uint64_t)(uint32_t)addr2);
 }
 
 void *getNIDfunc(const char * vsh_module, uint32_t fnid, int32_t offset) {
@@ -1457,6 +1467,8 @@ static int32_t register_ldd_controller(XPAD_UNIT_t *unit) {
   int32_t port, s, r;
   uint32_t capability, mode, port_setting;
 
+  memset(data, 0, sizeof(data));
+
   // claim a pad slot on first registration; endpoint units (e.g. the four
   // per wireless receiver) exist without a slot until a pad is really there
   if (unit->number < 0) {
@@ -1640,6 +1652,13 @@ static volatile uint64_t inject_call_t0;
 #define XPAD_INJECT_HANG_USEC 15000000ULL
 static uint8_t inject_hang_logged;
 
+// Safe handling for disabled syscalls / stealth mode (HEN / webMAN)
+static volatile uint8_t ps3mapi_disabled = 0;
+
+static inline int32_t is_syscall_disabled(int32_t r) {
+  return (r == -1 || (uint32_t)r == 0x80010003);
+}
+
 // never inject into VSH or the system processes - only into an actual game/app
 static int32_t is_system_process(const char *name) {
   static const char *sys[] = {"vsh", "sys_", "default.self"};
@@ -1655,17 +1674,17 @@ static int32_t is_system_process(const char *name) {
 
 static int32_t ps3mapi_get_all_pids(uint32_t *pids) {
   memset(pids, 0, sizeof(uint32_t) * PS3MAPI_MAX_PROC);
-  system_call_3(8, SYSCALL8_OPCODE_PS3MAPI, PS3MAPI_OPCODE_GET_ALL_PROC_PID, (uint64_t)(uint32_t)pids);
+  system_call_3(8, (uint64_t)SYSCALL8_OPCODE_PS3MAPI, (uint64_t)PS3MAPI_OPCODE_GET_ALL_PROC_PID, (uint64_t)(uintptr_t)pids);
   return (int32_t)p1;
 }
 
 static void ps3mapi_get_proc_name(uint32_t pid, char *name) {
   name[0] = 0;
-  system_call_4(8, SYSCALL8_OPCODE_PS3MAPI, PS3MAPI_OPCODE_GET_PROC_NAME_BY_PID, (uint64_t)pid, (uint64_t)(uint32_t)name);
+  system_call_4(8, (uint64_t)SYSCALL8_OPCODE_PS3MAPI, (uint64_t)PS3MAPI_OPCODE_GET_PROC_NAME_BY_PID, (uint64_t)(uint32_t)pid, (uint64_t)(uintptr_t)name);
 }
 
 static int32_t ps3mapi_load_module(uint32_t pid, const char *path) {
-  system_call_6(8, SYSCALL8_OPCODE_PS3MAPI, PS3MAPI_OPCODE_LOAD_PROC_MODULE, (uint64_t)pid, (uint64_t)(uint32_t)path, 0, 0);
+  system_call_6(8, (uint64_t)SYSCALL8_OPCODE_PS3MAPI, (uint64_t)PS3MAPI_OPCODE_LOAD_PROC_MODULE, (uint64_t)(uint32_t)pid, (uint64_t)(uintptr_t)path, 0ULL, 0ULL);
   return (int32_t)p1;
 }
 
@@ -1738,7 +1757,16 @@ static void try_auto_inject(void) {
   char name[256]; // generous: PS3MAPI writes the process self-path here
   int32_t i, r, age;
 
+  if (ps3mapi_disabled) {
+    return;
+  }
+
   if ((r = ps3mapi_get_all_pids(pids)) < 0) {
+    if (is_syscall_disabled(r)) {
+      xlog("auto-inject: Syscall 8 / PS3MAPI disabled or unavailable (stealth mode / HEN), disabling auto-inject");
+      ps3mapi_disabled = 1;
+      return;
+    }
     if (inject_log_budget > 0) {
       inject_log_budget--;
       xlog_code("auto-inject: get_all_pids failed", r);
@@ -1789,6 +1817,11 @@ static void try_auto_inject(void) {
     inject_call_t0 = time_now_usec();
     r = ps3mapi_load_module(pids[i], XPAD_GAME_SPRX_PATH);
     inject_call_t0 = 0;
+    if (is_syscall_disabled(r)) {
+      xlog("auto-inject: Syscall 8 / PS3MAPI disabled during load_module (stealth mode / HEN), disabling auto-inject");
+      ps3mapi_disabled = 1;
+      return;
+    }
     if (r >= 0) {
       mark_injected(pids[i]);
       pending_forget(pids[i]); // settled and injected: stop tracking it
@@ -1828,9 +1861,9 @@ static int32_t auto_inject_opted_in(void) {
 // within one sleep period and exits; xpadd_stop_thread joins it.
 static void inject_thread(uint64_t arg) {
   (void)arg;
-  while (running) {
+  while (running && !ps3mapi_disabled) {
     sys_timer_sleep(2);
-    if (!running) {
+    if (!running || ps3mapi_disabled) {
       break;
     }
     try_auto_inject();
@@ -2398,6 +2431,7 @@ static int32_t xpad_set_rumble(XPAD_UNIT_t *unit, uint8_t lval, uint8_t rval) {
 static int32_t get_device_desc(int32_t dev_id, void *p) {
   (void) dev_id;
   UsbDeviceDescriptor *desc = (UsbDeviceDescriptor *)p;
+  (void) desc;
 
   // do nothing
   return(CELL_OK);
@@ -2408,6 +2442,8 @@ static int32_t get_configration_desc(int32_t dev_id, void *p) {
   UsbConfigurationDescriptor *desc = (UsbConfigurationDescriptor *)p;
   uint16_t wTotalLength;
   wTotalLength = SWAP16(desc->wTotalLength);
+  (void) wTotalLength;
+  (void) desc;
 
   // do nothing
   return(CELL_OK);
@@ -2416,6 +2452,7 @@ static int32_t get_configration_desc(int32_t dev_id, void *p) {
 static int32_t get_interface_desc(int32_t dev_id, void *p) {
   (void) dev_id;
   UsbInterfaceDescriptor *desc = (UsbInterfaceDescriptor *)p;
+  (void) desc;
 
   // do nothing
   return(CELL_OK);
@@ -3647,7 +3684,7 @@ static int32_t shutdown_usb(void) {
   return(CELL_OK);
 }
 
-static int xpadd_thread(uint64_t arg) {
+static void xpadd_thread(uint64_t arg) {
   unsigned char xpad_data[MAX_XPAD_DATA_LEN];
   int32_t i, r;
   XPAD_UNIT_t *unit;
@@ -3716,7 +3753,7 @@ static int xpadd_thread(uint64_t arg) {
   // thread cannot be created, run without auto-injection rather than risk it.
   if (!auto_inject_opted_in()) {
     xlog("auto-inject: disabled (no /dev_hdd0/plugins/xpad_auto_inject.txt); use webMAN Game Plugins for rumble");
-  } else if (sys_ppu_thread_create(&inject_thread_id, inject_thread, NULL, 1000, 0x2000,
+  } else if (sys_ppu_thread_create(&inject_thread_id, inject_thread, 0ULL, 1000, 0x2000,
                                    SYS_PPU_THREAD_CREATE_JOINABLE, INJECT_THREAD_NAME) != CELL_OK) {
     inject_thread_id = (sys_ppu_thread_t)-1;
     xlog("auto-inject: thread create failed, auto-injection disabled");
@@ -3769,17 +3806,16 @@ static int xpadd_thread(uint64_t arg) {
   btd_detach_all();
   shutdown_usb();
   sys_ppu_thread_exit(0);
-  return(0);
 }
 
 int xpadd_start(uint64_t arg) {
-  sys_ppu_thread_create(&thread_id, xpadd_thread, NULL, -0x1d8, 0x2000, SYS_PPU_THREAD_CREATE_JOINABLE, THREAD_NAME);
+  sys_ppu_thread_create(&thread_id, xpadd_thread, 0ULL, -0x1d8, 0x2000, SYS_PPU_THREAD_CREATE_JOINABLE, THREAD_NAME);
   _sys_ppu_thread_exit(0);
   return(SYS_PRX_RESIDENT);
 }
 
 static void xpadd_stop_thread(uint64_t arg) {
-  uint64_t exit_code;
+  uint64_t exit_code = 0;
 #if XPAD_AUTO_INJECT
   int32_t i;
 #endif
@@ -3795,25 +3831,36 @@ static void xpadd_stop_thread(uint64_t arg) {
     for (i = 0; i < 50 && inject_call_t0 != 0; i++) {
       sys_timer_usleep(100000);
     }
-    if (inject_call_t0 == 0) {
-      sys_ppu_thread_join(inject_thread_id, &exit_code);
+    if (inject_call_t0 != 0) {
+      // Critical PS3HEN fix: A kernel PS3MAPI call is wedged or in progress.
+      // If we unload the PRX, the kernel returns into unmapped memory, causing a fatal DSI crash.
+      // NEVER allow xpadd_stop() to return SYS_PRX_STOP_OK while the thread is still active!
+      xlog("auto-inject: kernel call wedged (inject_call_t0 != 0); blocking PRX unload to prevent DSI crash");
+      show_msg((char *)"XPAD: Unload failed (kernel thread busy)!");
+      sys_ppu_thread_exit(SYS_PRX_STOP_ERROR);
+      return;
     }
+    sys_ppu_thread_join(inject_thread_id, &exit_code);
     inject_thread_id = (sys_ppu_thread_t)-1;
   }
 #endif
   if (thread_id != (sys_ppu_thread_t)-1) {
     sys_ppu_thread_join(thread_id, &exit_code);
   }
-  show_msg("XPAD Unloaded!");
+  show_msg((char *)"XPAD Unloaded!");
   sys_ppu_thread_exit(0);
 }
 
 int xpadd_stop(void) {
   sys_ppu_thread_t t;
-  uint64_t exit_code;
+  uint64_t exit_code = 0;
 
-  sys_ppu_thread_create(&t, xpadd_stop_thread, 0, 0, 0x2000, SYS_PPU_THREAD_CREATE_JOINABLE, STOP_THREAD_NAME);
+  sys_ppu_thread_create(&t, xpadd_stop_thread, 0ULL, 0, 0x2000, SYS_PPU_THREAD_CREATE_JOINABLE, STOP_THREAD_NAME);
   sys_ppu_thread_join(t, &exit_code);
+  if (exit_code != 0) {
+    _sys_ppu_thread_exit(SYS_PRX_STOP_ERROR);
+    return(SYS_PRX_STOP_ERROR);
+  }
   _sys_ppu_thread_exit(0);
   return(SYS_PRX_STOP_OK);
 }

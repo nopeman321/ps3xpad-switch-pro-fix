@@ -11,7 +11,7 @@
 CC      ?= cc
 CFLAGS  ?= -std=c11 -O2
 WARN     = -Wall -Wextra -pedantic
-TARGETS  = test_switch_pro test_bt_dongle
+TARGETS  = test_switch_pro test_bt_dongle test_hen_integration
 
 .PHONY: all test run clean
 
@@ -23,13 +23,18 @@ test_switch_pro: test_switch_pro.c
 test_bt_dongle: test_bt_dongle.c
 	$(CC) $(CFLAGS) $(WARN) -o $@ $<
 
+test_hen_integration: test_hen_integration.c
+	$(CC) $(CFLAGS) $(WARN) -o $@ $<
+
 test: $(TARGETS)
 	./test_switch_pro
 	./test_bt_dongle
+	./test_hen_integration
 
 run: $(TARGETS)
 	./test_switch_pro
 	./test_bt_dongle
+	./test_hen_integration
 
 clean:
-	rm -f $(TARGETS) test_switch_pro.exe test_bt_dongle.exe
+	rm -f $(TARGETS) test_switch_pro.exe test_bt_dongle.exe test_hen_integration.exe
