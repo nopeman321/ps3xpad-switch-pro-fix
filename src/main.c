@@ -17,6 +17,7 @@
 #include "ControlStruct.h"
 #include "xpad_rumble.h"
 #include "bt_dongle.h"
+#include "xmb_ui.h"
 
 #define THREAD_NAME "xpaddt"
 #define STOP_THREAD_NAME "xpadds"
@@ -458,9 +459,14 @@ typedef struct xpad_unit {
   uint8_t swpro_state;
   int32_t swpro_timer;
   uint32_t swpro_keepalive_timer;
-  uint8_t swpro_gyro_mode;     /* 0 = SIXAXIS only, 1 = Gyro Aim on L2/ZL, 2 = Gyro Aim Always */
-  uint8_t swpro_cap_r3_prev;   /* Edge detector for Capture + R3 toggle */
-  int16_t swpro_gyr_bias_x;    /* Auto-calibration resting bias X */
+  uint8_t swpro_gyro_mode;       /* 0 = SIXAXIS only, 1 = Gyro Aim on L2/ZL, 2 = Gyro Aim Always */
+  uint8_t swpro_star_prev;       /* Edge detector for Star/Capture button overlay toggle */
+  uint8_t swpro_post_close_guard;/* Keeps pad neutral after overlay closes until buttons release */
+  uint8_t swpro_recal_pending;   /* Pending gyro zero-bias recalibration */
+  uint8_t swpro_recal_count;     /* Sample counter for multi-report gyro averaging */
+  int32_t swpro_recal_sum_y;     /* Accumulator for gyro Y bias */
+  int32_t swpro_recal_sum_z;     /* Accumulator for gyro Z bias */
+  int16_t swpro_gyr_bias_x;      /* Auto-calibration resting bias X */
   int16_t swpro_gyr_bias_y;    /* Auto-calibration resting bias Y */
   int16_t swpro_gyr_bias_z;    /* Auto-calibration resting bias Z */
 
@@ -612,7 +618,7 @@ static uint8_t btd_class_registered = 0;
 
 static XPAD_t XPAD;
 static uint8_t xpad_led[4] = {ledOn1, ledOn2, ledOn3, ledOn4};
-static sys_ppu_thread_t thread_id = 1;
+static sys_ppu_thread_t thread_id = (sys_ppu_thread_t)-1;
 static sys_mutex_t xpad_mutex;
 static int32_t handle[CELL_PAD_MAX_PORT_NUM];
 static volatile uint8_t running;
@@ -2418,6 +2424,11 @@ static int32_t xpad_set_led(XPAD_UNIT_t *unit, uint8_t led) {
 }
 
 static int32_t xpad_set_rumble(XPAD_UNIT_t *unit, uint8_t lval, uint8_t rval) {
+  xpad_ui_config_t *cfg = xmb_ui_get_config();
+  if (cfg != NULL && !cfg->rumble_enabled) {
+    lval = 0;
+    rval = 0;
+  }
   uint8_t out[8] = {0x00, 0x08, 0x00, lval, rval, 0x00, 0x00, 0x00};
 
   if (write_xpad(unit, out, 8) < 0) {
@@ -2982,7 +2993,7 @@ static int32_t swpro_detach_all(void) {
 
   block(xpad_mutex);
   for (i = 0; i < MAX_UNIT_NUM; i++) {
-    if ((unit = XPAD.units[i]) != NULL && unit->xtype == XTYPE_SWITCH_PRO) {
+    if ((unit = XPAD.units[i]) != NULL && unit->xtype == XTYPE_SWITCH_PRO && !unit->is_bt) {
       XPAD.units[i] = NULL;
       unregister_ldd_controller(unit);
       unit_free(unit);
@@ -3065,7 +3076,8 @@ static void swpro_read_report(XPAD_UNIT_t *unit, int32_t id, uint8_t *readBuf, i
   data.button[CELL_PAD_BTN_OFFSET_SENSOR_G] = 0x0200;
 
   if (readBuf[0] == SWPRO_IN_FULL || readBuf[0] == SWPRO_IN_SUBCMD_REPLY) {
-    if (readBuf[0] == SWPRO_IN_SUBCMD_REPLY) {
+    xpad_ui_config_t *cfg = xmb_ui_get_config();
+    if (readBuf[0] == SWPRO_IN_SUBCMD_REPLY && len >= 15) {
       static uint8_t s_subcmd_ack_logged = 0;
       if (!s_subcmd_ack_logged) {
         s_subcmd_ack_logged = 1;
@@ -3076,20 +3088,23 @@ static void swpro_read_report(XPAD_UNIT_t *unit, int32_t id, uint8_t *readBuf, i
     uint8_t btn_shared = readBuf[4];
     uint8_t btn_left   = readBuf[5];
 
-    // Toggle Gyro Aiming mode on Capture + R3 rising edge
+    /* If Bluetooth is active and preferred, keep wired USB pad neutral to avoid duplicate input while charging */
+    if (unit != NULL && !unit->is_bt && cfg->conn_mode == XPAD_CONN_BLUETOOTH && btd_is_connected()) {
+      cellPadLddDataInsert(handle[id], &data);
+      return;
+    }
+
+    /* Toggle XMB terminal overlay on Star/Capture button rising edge */
     if (unit != NULL) {
-      uint8_t cap_r3_now = ((btn_shared & SWPRO_BTN_CAPTURE) && (btn_shared & SWPRO_BTN_RSTICK)) ? 1 : 0;
-      if (cap_r3_now && !unit->swpro_cap_r3_prev) {
-        unit->swpro_gyro_mode = (unit->swpro_gyro_mode + 1) % 3;
-        if (unit->swpro_gyro_mode == 0) {
-          show_msg((char *)"XPAD: Gyro Aim -> OFF (SIXAXIS Native Only)");
-        } else if (unit->swpro_gyro_mode == 1) {
-          show_msg((char *)"XPAD: Gyro Aim -> ON (Hold L2/ZL)");
-        } else {
-          show_msg((char *)"XPAD: Gyro Aim -> ON (Always Active)");
+      uint8_t star_now = (btn_shared & SWPRO_BTN_CAPTURE) ? 1 : 0;
+      if (star_now && !unit->swpro_star_prev) {
+        uint8_t was_open = xmb_ui_is_open();
+        xmb_ui_toggle();
+        if (was_open && !xmb_ui_is_open()) {
+          unit->swpro_post_close_guard = 1;
         }
       }
-      unit->swpro_cap_r3_prev = cap_r3_now;
+      unit->swpro_star_prev = star_now;
     }
 
     uint16_t lx_12 = (uint16_t)readBuf[6] | ((uint16_t)(readBuf[7] & 0x0F) << 8);
@@ -3097,20 +3112,67 @@ static void swpro_read_report(XPAD_UNIT_t *unit, int32_t id, uint8_t *readBuf, i
     uint16_t rx_12 = (uint16_t)readBuf[9] | ((uint16_t)(readBuf[10] & 0x0F) << 8);
     uint16_t ry_12 = (uint16_t)(readBuf[10] >> 4) | ((uint16_t)readBuf[11] << 4);
 
-    *analog_lx = swpro_scale_axis_12bit(lx_12, 0);
-    *analog_ly = swpro_scale_axis_12bit(ly_12, 1); // invert Y for PS3
-    *analog_rx = swpro_scale_axis_12bit(rx_12, 0);
-    *analog_ry = swpro_scale_axis_12bit(ry_12, 1); // invert Y for PS3
+    uint8_t lx_8 = swpro_scale_axis_12bit(lx_12, 0);
+    uint8_t ly_8 = swpro_scale_axis_12bit(ly_12, 1); /* invert Y for PS3 */
 
-    // Physical layout matches PlayStation layout:
-    // Y (left)   -> Square
-    // X (top)    -> Triangle
-    // B (bottom) -> Cross
-    // A (right)  -> Circle
-    *digit2 = (btn_right & SWPRO_BTN_Y) ? *digit2 | CELL_PAD_CTRL_SQUARE : *digit2 & ~CELL_PAD_CTRL_SQUARE;
-    *digit2 = (btn_right & SWPRO_BTN_X) ? *digit2 | CELL_PAD_CTRL_TRIANGLE : *digit2 & ~CELL_PAD_CTRL_TRIANGLE;
-    *digit2 = (btn_right & SWPRO_BTN_B) ? *digit2 | CELL_PAD_CTRL_CROSS : *digit2 & ~CELL_PAD_CTRL_CROSS;
-    *digit2 = (btn_right & SWPRO_BTN_A) ? *digit2 | CELL_PAD_CTRL_CIRCLE : *digit2 & ~CELL_PAD_CTRL_CIRCLE;
+    if (xmb_ui_is_open()) {
+      uint32_t nav = 0;
+      if ((btn_left & SWPRO_BTN_UP) || ly_8 < 0x40)    nav |= UI_NAV_UP;
+      if ((btn_left & SWPRO_BTN_DOWN) || ly_8 > 0xC0)  nav |= UI_NAV_DOWN;
+      if ((btn_left & SWPRO_BTN_LEFT) || lx_8 < 0x40)  nav |= UI_NAV_LEFT;
+      if ((btn_left & SWPRO_BTN_RIGHT) || lx_8 > 0xC0) nav |= UI_NAV_RIGHT;
+      if (cfg->switch_layout) {
+        if (btn_right & SWPRO_BTN_A) nav |= UI_NAV_CONFIRM;
+        if (btn_right & SWPRO_BTN_B) nav |= UI_NAV_BACK;
+      } else {
+        if (btn_right & SWPRO_BTN_B) nav |= UI_NAV_CONFIRM;
+        if (btn_right & SWPRO_BTN_A) nav |= UI_NAV_BACK;
+      }
+      if (btn_shared & SWPRO_BTN_PLUS)  nav |= UI_NAV_CONFIRM;
+      if (btn_shared & SWPRO_BTN_MINUS) nav |= UI_NAV_BACK;
+      xmb_ui_handle_input(nav);
+      if (!xmb_ui_is_open() && unit != NULL) {
+        unit->swpro_post_close_guard = 1;
+      }
+      cellPadLddDataInsert(handle[id], &data);
+      return;
+    }
+
+    if (unit != NULL && unit->swpro_post_close_guard) {
+      if (btn_right == 0 && btn_left == 0 && (btn_shared & ~SWPRO_BTN_CAPTURE) == 0) {
+        unit->swpro_post_close_guard = 0;
+      } else {
+        cellPadLddDataInsert(handle[id], &data);
+        return;
+      }
+    }
+
+    *analog_lx = lx_8;
+    *analog_ly = ly_8;
+    *analog_rx = swpro_scale_axis_12bit(rx_12, 0);
+    *analog_ry = swpro_scale_axis_12bit(ry_12, 1); /* invert Y for PS3 */
+
+    if (cfg->switch_layout) {
+      /* Nintendo Switch label layout: A->Cross, B->Circle, X->Square, Y->Triangle */
+      *digit2 = (btn_right & SWPRO_BTN_X) ? *digit2 | CELL_PAD_CTRL_SQUARE : *digit2 & ~CELL_PAD_CTRL_SQUARE;
+      *digit2 = (btn_right & SWPRO_BTN_Y) ? *digit2 | CELL_PAD_CTRL_TRIANGLE : *digit2 & ~CELL_PAD_CTRL_TRIANGLE;
+      *digit2 = (btn_right & SWPRO_BTN_A) ? *digit2 | CELL_PAD_CTRL_CROSS : *digit2 & ~CELL_PAD_CTRL_CROSS;
+      *digit2 = (btn_right & SWPRO_BTN_B) ? *digit2 | CELL_PAD_CTRL_CIRCLE : *digit2 & ~CELL_PAD_CTRL_CIRCLE;
+      *press_square = (btn_right & SWPRO_BTN_X) ? 0xFF : 0;
+      *press_triangle = (btn_right & SWPRO_BTN_Y) ? 0xFF : 0;
+      *press_cross = (btn_right & SWPRO_BTN_A) ? 0xFF : 0;
+      *press_circle = (btn_right & SWPRO_BTN_B) ? 0xFF : 0;
+    } else {
+      /* Physical layout matches PlayStation layout: Y->Square, X->Triangle, B->Cross, A->Circle */
+      *digit2 = (btn_right & SWPRO_BTN_Y) ? *digit2 | CELL_PAD_CTRL_SQUARE : *digit2 & ~CELL_PAD_CTRL_SQUARE;
+      *digit2 = (btn_right & SWPRO_BTN_X) ? *digit2 | CELL_PAD_CTRL_TRIANGLE : *digit2 & ~CELL_PAD_CTRL_TRIANGLE;
+      *digit2 = (btn_right & SWPRO_BTN_B) ? *digit2 | CELL_PAD_CTRL_CROSS : *digit2 & ~CELL_PAD_CTRL_CROSS;
+      *digit2 = (btn_right & SWPRO_BTN_A) ? *digit2 | CELL_PAD_CTRL_CIRCLE : *digit2 & ~CELL_PAD_CTRL_CIRCLE;
+      *press_square = (btn_right & SWPRO_BTN_Y) ? 0xFF : 0;
+      *press_triangle = (btn_right & SWPRO_BTN_X) ? 0xFF : 0;
+      *press_cross = (btn_right & SWPRO_BTN_B) ? 0xFF : 0;
+      *press_circle = (btn_right & SWPRO_BTN_A) ? 0xFF : 0;
+    }
 
     *digit1 = (btn_left & SWPRO_BTN_UP) ? *digit1 | CELL_PAD_CTRL_UP : *digit1 & ~CELL_PAD_CTRL_UP;
     *digit1 = (btn_left & SWPRO_BTN_DOWN) ? *digit1 | CELL_PAD_CTRL_DOWN : *digit1 & ~CELL_PAD_CTRL_DOWN;
@@ -3125,24 +3187,30 @@ static void swpro_read_report(XPAD_UNIT_t *unit, int32_t id, uint8_t *readBuf, i
       *digit0 |= CELL_PAD_CTRL_LDD_PS;
     }
 
-    *digit2 = (btn_right & SWPRO_BTN_R) ? *digit2 | CELL_PAD_CTRL_R1 : *digit2 & ~CELL_PAD_CTRL_R1;
-    *digit2 = (btn_left & SWPRO_BTN_L) ? *digit2 | CELL_PAD_CTRL_L1 : *digit2 & ~CELL_PAD_CTRL_L1;
-    *digit2 = (btn_right & SWPRO_BTN_ZR) ? *digit2 | CELL_PAD_CTRL_R2 : *digit2 & ~CELL_PAD_CTRL_R2;
-    *digit2 = (btn_left & SWPRO_BTN_ZL) ? *digit2 | CELL_PAD_CTRL_L2 : *digit2 & ~CELL_PAD_CTRL_L2;
-
-    *press_r1 = (btn_right & SWPRO_BTN_R) ? 0xFF : 0;
-    *press_l1 = (btn_left & SWPRO_BTN_L) ? 0xFF : 0;
-    *press_r2 = (btn_right & SWPRO_BTN_ZR) ? 0xFF : 0;
-    *press_l2 = (btn_left & SWPRO_BTN_ZL) ? 0xFF : 0;
+    if (cfg->swap_triggers) {
+      *digit2 = (btn_right & SWPRO_BTN_ZR) ? *digit2 | CELL_PAD_CTRL_R1 : *digit2 & ~CELL_PAD_CTRL_R1;
+      *digit2 = (btn_left & SWPRO_BTN_ZL) ? *digit2 | CELL_PAD_CTRL_L1 : *digit2 & ~CELL_PAD_CTRL_L1;
+      *digit2 = (btn_right & SWPRO_BTN_R) ? *digit2 | CELL_PAD_CTRL_R2 : *digit2 & ~CELL_PAD_CTRL_R2;
+      *digit2 = (btn_left & SWPRO_BTN_L) ? *digit2 | CELL_PAD_CTRL_L2 : *digit2 & ~CELL_PAD_CTRL_L2;
+      *press_r1 = (btn_right & SWPRO_BTN_ZR) ? 0xFF : 0;
+      *press_l1 = (btn_left & SWPRO_BTN_ZL) ? 0xFF : 0;
+      *press_r2 = (btn_right & SWPRO_BTN_R) ? 0xFF : 0;
+      *press_l2 = (btn_left & SWPRO_BTN_L) ? 0xFF : 0;
+    } else {
+      *digit2 = (btn_right & SWPRO_BTN_R) ? *digit2 | CELL_PAD_CTRL_R1 : *digit2 & ~CELL_PAD_CTRL_R1;
+      *digit2 = (btn_left & SWPRO_BTN_L) ? *digit2 | CELL_PAD_CTRL_L1 : *digit2 & ~CELL_PAD_CTRL_L1;
+      *digit2 = (btn_right & SWPRO_BTN_ZR) ? *digit2 | CELL_PAD_CTRL_R2 : *digit2 & ~CELL_PAD_CTRL_R2;
+      *digit2 = (btn_left & SWPRO_BTN_ZL) ? *digit2 | CELL_PAD_CTRL_L2 : *digit2 & ~CELL_PAD_CTRL_L2;
+      *press_r1 = (btn_right & SWPRO_BTN_R) ? 0xFF : 0;
+      *press_l1 = (btn_left & SWPRO_BTN_L) ? 0xFF : 0;
+      *press_r2 = (btn_right & SWPRO_BTN_ZR) ? 0xFF : 0;
+      *press_l2 = (btn_left & SWPRO_BTN_ZL) ? 0xFF : 0;
+    }
 
     *press_up = (btn_left & SWPRO_BTN_UP) ? 0xFF : 0;
     *press_down = (btn_left & SWPRO_BTN_DOWN) ? 0xFF : 0;
     *press_left = (btn_left & SWPRO_BTN_LEFT) ? 0xFF : 0;
     *press_right = (btn_left & SWPRO_BTN_RIGHT) ? 0xFF : 0;
-    *press_square = (btn_right & SWPRO_BTN_Y) ? 0xFF : 0;
-    *press_triangle = (btn_right & SWPRO_BTN_X) ? 0xFF : 0;
-    *press_cross = (btn_right & SWPRO_BTN_B) ? 0xFF : 0;
-    *press_circle = (btn_right & SWPRO_BTN_A) ? 0xFF : 0;
 
     // Decode 36 bytes of IMU data (3 frames of 12 bytes each: offsets 13, 25, 37)
     if (readBuf[0] == SWPRO_IN_FULL && len >= 49) {
@@ -3183,18 +3251,35 @@ static void swpro_read_report(XPAD_UNIT_t *unit, int32_t id, uint8_t *readBuf, i
 
       // Mode B: Gyro-to-Right-Stick Aiming
       if (unit != NULL) {
-        int gyro_aim_active = (unit->swpro_gyro_mode == 2) ||
-                              (unit->swpro_gyro_mode == 1 && (btn_left & SWPRO_BTN_ZL));
+        if (unit->swpro_recal_pending) {
+          unit->swpro_recal_sum_y += avg_gyr_y;
+          unit->swpro_recal_sum_z += avg_gyr_z;
+          if (++unit->swpro_recal_count >= 16) {
+            unit->swpro_gyr_bias_y = (int16_t)(unit->swpro_recal_sum_y / 16);
+            unit->swpro_gyr_bias_z = (int16_t)(unit->swpro_recal_sum_z / 16);
+            unit->swpro_recal_sum_y = 0;
+            unit->swpro_recal_sum_z = 0;
+            unit->swpro_recal_count = 0;
+            unit->swpro_recal_pending = 0;
+          }
+        }
+        uint8_t gmode = cfg->gyro_mode;
+        unit->swpro_gyro_mode = gmode;
+        uint8_t zl_active = cfg->swap_triggers ? (btn_left & SWPRO_BTN_L) : (btn_left & SWPRO_BTN_ZL);
+        int gyro_aim_active = (gmode == XPAD_GYRO_ALWAYS) ||
+                              (gmode == XPAD_GYRO_HOLD_ZL && zl_active);
         if (gyro_aim_active) {
+          int32_t gyr_y = avg_gyr_y - (int32_t)unit->swpro_gyr_bias_y;
+          int32_t gyr_z = avg_gyr_z - (int32_t)unit->swpro_gyr_bias_z;
           int32_t delta_rx = 0;
           int32_t delta_ry = 0;
 
           // Anti-drift deadzone (~25 LSB)
-          if (avg_gyr_z > 25 || avg_gyr_z < -25) {
-            delta_rx = (-avg_gyr_z) / 45;
+          if (gyr_z > 25 || gyr_z < -25) {
+            delta_rx = (-gyr_z) / 45;
           }
-          if (avg_gyr_y > 25 || avg_gyr_y < -25) {
-            delta_ry = (-avg_gyr_y) / 45;
+          if (gyr_y > 25 || gyr_y < -25) {
+            delta_ry = (-gyr_y) / 45;
           }
 
           if (delta_rx != 0 || delta_ry != 0) {
@@ -3206,9 +3291,59 @@ static void swpro_read_report(XPAD_UNIT_t *unit, int32_t id, uint8_t *readBuf, i
     }
 
   } else if (readBuf[0] == SWPRO_IN_SIMPLE) {
+    xpad_ui_config_t *cfg = xmb_ui_get_config();
     // 0x3F simple HID report: readBuf[1..2] buttons, readBuf[3] hat, readBuf[4..11] 4 axes 16-bit LE
     uint16_t b = (uint16_t)readBuf[1] | ((uint16_t)readBuf[2] << 8);
     uint8_t hat = readBuf[3];
+
+    if (unit != NULL && !unit->is_bt && cfg->conn_mode == XPAD_CONN_BLUETOOTH && btd_is_connected()) {
+      cellPadLddDataInsert(handle[id], &data);
+      return;
+    }
+
+    if (unit != NULL) {
+      uint8_t star_now = (b & (1 << 13)) ? 1 : 0;
+      if (star_now && !unit->swpro_star_prev) {
+        uint8_t was_open = xmb_ui_is_open();
+        xmb_ui_toggle();
+        if (was_open && !xmb_ui_is_open()) {
+          unit->swpro_post_close_guard = 1;
+        }
+      }
+      unit->swpro_star_prev = star_now;
+    }
+
+    if (xmb_ui_is_open()) {
+      uint32_t nav = 0;
+      if (hat == 0 || hat == 1 || hat == 7 || readBuf[7] < 0x40) nav |= UI_NAV_UP;
+      if (hat == 3 || hat == 4 || hat == 5 || readBuf[7] > 0xC0) nav |= UI_NAV_DOWN;
+      if (hat == 5 || hat == 6 || hat == 7 || readBuf[5] < 0x40) nav |= UI_NAV_LEFT;
+      if (hat == 1 || hat == 2 || hat == 3 || readBuf[5] > 0xC0) nav |= UI_NAV_RIGHT;
+      if (cfg->switch_layout) {
+        if (b & (1 << 0)) nav |= UI_NAV_CONFIRM;
+        if (b & (1 << 1)) nav |= UI_NAV_BACK;
+      } else {
+        if (b & (1 << 1)) nav |= UI_NAV_CONFIRM;
+        if (b & (1 << 0)) nav |= UI_NAV_BACK;
+      }
+      if (b & (1 << 9)) nav |= UI_NAV_CONFIRM;
+      if (b & (1 << 8)) nav |= UI_NAV_BACK;
+      xmb_ui_handle_input(nav);
+      if (!xmb_ui_is_open() && unit != NULL) {
+        unit->swpro_post_close_guard = 1;
+      }
+      cellPadLddDataInsert(handle[id], &data);
+      return;
+    }
+
+    if (unit != NULL && unit->swpro_post_close_guard) {
+      if ((b & ~(1 << 13)) == 0 && hat == 0x08) {
+        unit->swpro_post_close_guard = 0;
+      } else {
+        cellPadLddDataInsert(handle[id], &data);
+        return;
+      }
+    }
 
     // Hat to D-pad
     if (hat == 0 || hat == 1 || hat == 7) *digit1 |= CELL_PAD_CTRL_UP;
@@ -3217,10 +3352,17 @@ static void swpro_read_report(XPAD_UNIT_t *unit, int32_t id, uint8_t *readBuf, i
     if (hat == 5 || hat == 6 || hat == 7) *digit1 |= CELL_PAD_CTRL_LEFT;
 
     // Face buttons: Simple HID: bit0=A, bit1=B, bit2=X, bit3=Y
-    if (b & (1 << 3)) *digit2 |= CELL_PAD_CTRL_SQUARE;   // Y (left) -> Square
-    if (b & (1 << 2)) *digit2 |= CELL_PAD_CTRL_TRIANGLE; // X (top) -> Triangle
-    if (b & (1 << 1)) *digit2 |= CELL_PAD_CTRL_CROSS;    // B (bottom) -> Cross
-    if (b & (1 << 0)) *digit2 |= CELL_PAD_CTRL_CIRCLE;   // A (right) -> Circle
+    if (cfg->switch_layout) {
+      if (b & (1 << 2)) *digit2 |= CELL_PAD_CTRL_SQUARE;   // X -> Square
+      if (b & (1 << 3)) *digit2 |= CELL_PAD_CTRL_TRIANGLE; // Y -> Triangle
+      if (b & (1 << 0)) *digit2 |= CELL_PAD_CTRL_CROSS;    // A -> Cross
+      if (b & (1 << 1)) *digit2 |= CELL_PAD_CTRL_CIRCLE;   // B -> Circle
+    } else {
+      if (b & (1 << 3)) *digit2 |= CELL_PAD_CTRL_SQUARE;   // Y (left) -> Square
+      if (b & (1 << 2)) *digit2 |= CELL_PAD_CTRL_TRIANGLE; // X (top) -> Triangle
+      if (b & (1 << 1)) *digit2 |= CELL_PAD_CTRL_CROSS;    // B (bottom) -> Cross
+      if (b & (1 << 0)) *digit2 |= CELL_PAD_CTRL_CIRCLE;   // A (right) -> Circle
+    }
 
     if (b & (1 << 9)) *digit1 |= CELL_PAD_CTRL_START;    // Plus
     if (b & (1 << 8)) *digit1 |= CELL_PAD_CTRL_SELECT;   // Minus
@@ -3228,10 +3370,17 @@ static void swpro_read_report(XPAD_UNIT_t *unit, int32_t id, uint8_t *readBuf, i
     if (b & (1 << 11)) *digit1 |= CELL_PAD_CTRL_R3;      // R3
     if (b & (1 << 12)) *digit0 |= CELL_PAD_CTRL_LDD_PS;  // Home
 
-    if (b & (1 << 5)) { *digit2 |= CELL_PAD_CTRL_R1; *press_r1 = 0xFF; }
-    if (b & (1 << 4)) { *digit2 |= CELL_PAD_CTRL_L1; *press_l1 = 0xFF; }
-    if (b & (1 << 7)) { *digit2 |= CELL_PAD_CTRL_R2; *press_r2 = 0xFF; }
-    if (b & (1 << 6)) { *digit2 |= CELL_PAD_CTRL_L2; *press_l2 = 0xFF; }
+    if (cfg->swap_triggers) {
+      if (b & (1 << 7)) { *digit2 |= CELL_PAD_CTRL_R1; *press_r1 = 0xFF; }
+      if (b & (1 << 6)) { *digit2 |= CELL_PAD_CTRL_L1; *press_l1 = 0xFF; }
+      if (b & (1 << 5)) { *digit2 |= CELL_PAD_CTRL_R2; *press_r2 = 0xFF; }
+      if (b & (1 << 4)) { *digit2 |= CELL_PAD_CTRL_L2; *press_l2 = 0xFF; }
+    } else {
+      if (b & (1 << 5)) { *digit2 |= CELL_PAD_CTRL_R1; *press_r1 = 0xFF; }
+      if (b & (1 << 4)) { *digit2 |= CELL_PAD_CTRL_L1; *press_l1 = 0xFF; }
+      if (b & (1 << 7)) { *digit2 |= CELL_PAD_CTRL_R2; *press_r2 = 0xFF; }
+      if (b & (1 << 6)) { *digit2 |= CELL_PAD_CTRL_L2; *press_l2 = 0xFF; }
+    }
 
     *analog_lx = readBuf[5]; // take high byte of 16-bit LE (or middle)
     *analog_ly = 255 - readBuf[7];
@@ -3308,9 +3457,14 @@ static int32_t swpro_set_led(XPAD_UNIT_t *unit, uint8_t led) {
 
 static int32_t swpro_set_rumble(XPAD_UNIT_t *unit, uint8_t lval, uint8_t rval) {
   uint8_t out[SWPRO_OUT_REPORT_LEN];
+  xpad_ui_config_t *cfg = xmb_ui_get_config();
 
   if (unit == NULL || unit->swpro_state != SWPRO_STATE_DONE) {
     return(CELL_OK);
+  }
+  if (cfg != NULL && !cfg->rumble_enabled) {
+    lval = 0;
+    rval = 0;
   }
   memset(out, 0, sizeof(out));
   out[0] = SWPRO_OUT_RUMBLE;
@@ -3320,27 +3474,38 @@ static int32_t swpro_set_rumble(XPAD_UNIT_t *unit, uint8_t lval, uint8_t rval) {
   if (lval == 0 && rval == 0) {
     memcpy(&out[2], swpro_rumble_neutral, 8);
   } else {
-    // Left motor (4 bytes: out[2..5])
+    /* Standard Switch Pro HD Rumble encoding: 320Hz HF (0x0100) + 160Hz LF (0x40) */
     if (lval > 0) {
-      out[2] = 0x88;
-      out[3] = 0x00;
-      out[4] = 0x62;
-      out[5] = (uint8_t)(0x40 + ((lval >> 2) & 0x3F));
+      uint8_t hf_amp = (uint8_t)(((uint32_t)lval * 100U) / 255U);
+      uint8_t lf_amp = (uint8_t)(((uint32_t)lval * 50U) / 255U);
+      if (hf_amp == 0) hf_amp = 1;
+      if (lf_amp == 0) lf_amp = 1;
+      out[2] = 0x00;
+      out[3] = (uint8_t)(0x01U | ((hf_amp << 1) & 0xFEU));
+      out[4] = 0x40;
+      out[5] = (uint8_t)(0x40U + lf_amp);
     } else {
       memcpy(&out[2], &swpro_rumble_neutral[0], 4);
     }
-    // Right motor (4 bytes: out[6..9])
     if (rval > 0) {
-      out[6] = 0x10;
-      out[7] = 0x88;
-      out[8] = 0x62;
-      out[9] = (uint8_t)(0x40 + ((rval >> 2) & 0x3F));
+      uint8_t hf_amp = (uint8_t)(((uint32_t)rval * 100U) / 255U);
+      uint8_t lf_amp = (uint8_t)(((uint32_t)rval * 50U) / 255U);
+      if (hf_amp == 0) hf_amp = 1;
+      if (lf_amp == 0) lf_amp = 1;
+      out[6] = 0x00;
+      out[7] = (uint8_t)(0x01U | ((hf_amp << 1) & 0xFEU));
+      out[8] = 0x40;
+      out[9] = (uint8_t)(0x40U + lf_amp);
     } else {
       memcpy(&out[6], &swpro_rumble_neutral[4], 4);
     }
   }
-  if (write_xpad(unit, out, 10) < 0) {
-    return(-1);
+  {
+    int32_t r = write_xpad(unit, out, 10);
+    if (r < 0) {
+      xlog_code("Switch rumble write_xpad failed", r);
+      return(-1);
+    }
   }
   return(CELL_OK);
 }
@@ -3594,6 +3759,10 @@ static void unregister_devices(void) {
     if (extra_lddreg[i]) {
       if (extra_info[i].xtype == XTYPE_XBOX360W) {
         cellUsbdUnregisterExtraLdd(&xpadw_ops);
+      } else if (extra_info[i].xtype == XTYPE_SWITCH_PRO) {
+        cellUsbdUnregisterExtraLdd(&swpro_ops);
+      } else if (extra_info[i].xtype == XTYPE_BTD) {
+        cellUsbdUnregisterExtraLdd(&btd_ops);
       } else {
         cellUsbdUnregisterExtraLdd(&xpad_ops);
       }
@@ -3684,6 +3853,67 @@ static int32_t shutdown_usb(void) {
   return(CELL_OK);
 }
 
+static void ui_on_conn_mode_changed(uint8_t new_mode) {
+  if (new_mode == XPAD_CONN_WIRED) {
+    btd_set_paused(1);
+    btd_disconnect();
+  } else {
+    btd_set_paused(0);
+    if (!btd_is_connected()) {
+      btd_rescan_dongle();
+    }
+  }
+}
+
+static void ui_on_dongle_rescan(void) {
+  if (btd_rescan_dongle() == 0) {
+    show_msg((char *)"XPAD: Rescanning BT Dongle...");
+  } else {
+    show_msg((char *)"XPAD: No BT Dongle attached!");
+  }
+}
+
+static void ui_on_gyro_mode_changed(uint8_t new_mode) {
+  (void)new_mode;
+}
+
+static void ui_on_recalibrate_gyro(void) {
+  int32_t i;
+  for (i = 0; i < MAX_UNIT_NUM; i++) {
+    if (XPAD.units[i] != NULL) {
+      XPAD.units[i]->swpro_recal_count = 0;
+      XPAD.units[i]->swpro_recal_sum_y = 0;
+      XPAD.units[i]->swpro_recal_sum_z = 0;
+      XPAD.units[i]->swpro_recal_pending = 1;
+    }
+  }
+}
+
+static uint8_t s_rumble_test_ticks = 0;
+
+static void ui_on_rumble_changed(uint8_t enabled) {
+  int32_t i;
+  uint8_t val = enabled ? 220 : 0;
+  s_rumble_test_ticks = enabled ? 20 : 0; /* 200ms test pulse when enabled */
+  for (i = 0; i < MAX_UNIT_NUM; i++) {
+    if (XPAD.units[i] != NULL && XPAD.units[i]->set_rumble != NULL) {
+      XPAD.units[i]->set_rumble(XPAD.units[i], val, val);
+    }
+  }
+}
+
+static void ui_on_notify(const char *msg) {
+  char buf[204];
+  int32_t i = 0;
+  if (msg == NULL) return;
+  while (msg[i] != '\0' && i < 200) {
+    buf[i] = msg[i];
+    i++;
+  }
+  buf[i] = '\0';
+  show_msg(buf);
+}
+
 static void xpadd_thread(uint64_t arg) {
   unsigned char xpad_data[MAX_XPAD_DATA_LEN];
   int32_t i, r;
@@ -3742,6 +3972,20 @@ static void xpadd_thread(uint64_t arg) {
     show_msg(msg);
   }
   running = 1;
+  {
+    xmb_ui_callbacks_t ui_cb;
+    ui_cb.on_conn_mode_changed = ui_on_conn_mode_changed;
+    ui_cb.on_dongle_rescan = ui_on_dongle_rescan;
+    ui_cb.on_gyro_mode_changed = ui_on_gyro_mode_changed;
+    ui_cb.on_recalibrate_gyro = ui_on_recalibrate_gyro;
+    ui_cb.on_rumble_changed = ui_on_rumble_changed;
+    ui_cb.on_notify = ui_on_notify;
+    ui_cb.is_dongle_present = btd_is_dongle_present;
+    ui_cb.is_bt_connected = btd_is_connected;
+    ui_cb.get_dongle_status = btd_get_status_str;
+    ui_cb.resolve_nid = getNIDfunc;
+    xmb_ui_init(&ui_cb);
+  }
 #if XPAD_AUTO_INJECT
   // Auto-injection is opt-in (the LOADER-WEDGE FIX note above): a hung
   // LOAD_PROC_MODULE wedges the lv2 loader and freezes every subsequent
@@ -3763,6 +4007,13 @@ static void xpadd_thread(uint64_t arg) {
 #endif
   while (running) {
     sys_timer_usleep(1000 * 10);
+    {
+      xpad_ui_config_t *uicfg = xmb_ui_get_config();
+      if (uicfg != NULL && uicfg->conn_mode == XPAD_CONN_BLUETOOTH &&
+          btd_is_dongle_present() && !btd_is_connected()) {
+        btd_set_paused(0);
+      }
+    }
     btd_poll_tick();
     block(xpad_mutex);
     for (i = 0; i < MAX_UNIT_NUM; i++) {
@@ -3780,7 +4031,24 @@ static void xpadd_thread(uint64_t arg) {
       }
     }
     check_pad_status();
+    if (s_rumble_test_ticks > 0) {
+      s_rumble_test_ticks--;
+      if (s_rumble_test_ticks == 0) {
+        for (i = 0; i < MAX_UNIT_NUM; i++) {
+          if (XPAD.units[i] != NULL && XPAD.units[i]->set_rumble != NULL) {
+            XPAD.units[i]->set_rumble(XPAD.units[i], 0, 0);
+          }
+        }
+      } else if ((s_rumble_test_ticks % 5) == 0) {
+        for (i = 0; i < MAX_UNIT_NUM; i++) {
+          if (XPAD.units[i] != NULL && XPAD.units[i]->set_rumble != NULL) {
+            XPAD.units[i]->set_rumble(XPAD.units[i], 220, 220);
+          }
+        }
+      }
+    }
     unblock(xpad_mutex);
+    xmb_ui_render_xmb();
 
     // forward rumble events from the game-process plugin to the USB pads
     // (route_rumble() takes xpad_mutex itself, so drain outside the lock)
@@ -3821,6 +4089,7 @@ static void xpadd_stop_thread(uint64_t arg) {
 #endif
 
   running = 0;
+  xmb_ui_close();
   sys_timer_usleep(500000);
 #if XPAD_AUTO_INJECT
   if (inject_thread_id != (sys_ppu_thread_t)-1) {

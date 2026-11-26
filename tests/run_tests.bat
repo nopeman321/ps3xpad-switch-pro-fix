@@ -37,7 +37,7 @@ test_bt_dongle.exe
 if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
 
 echo.
-echo [3/3] Compiling and running test_hen_integration...
+echo [3/4] Compiling and running test_hen_integration...
 cl /nologo /W3 /O2 test_hen_integration.c /Fe:test_hen_integration.exe >nul
 if %ERRORLEVEL% neq 0 (
     echo Failed to build test_hen_integration
@@ -47,6 +47,16 @@ test_hen_integration.exe
 if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
 
 echo.
+echo [4/4] Compiling and running test_xmb_ui...
+cl /nologo /W3 /O2 test_xmb_ui.c /Fe:test_xmb_ui.exe >nul
+if %ERRORLEVEL% neq 0 (
+    echo Failed to build test_xmb_ui
+    exit /b 1
+)
+test_xmb_ui.exe
+if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
+
+echo.
 echo ====================================================================
-echo  ALL TEST SUITES PASSED CLEANLY (341/341 assertions)
+echo  ALL TEST SUITES PASSED CLEANLY
 echo ====================================================================

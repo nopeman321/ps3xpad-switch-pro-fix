@@ -120,5 +120,11 @@ void    btd_poll_tick(void);
 void    btd_learn_controller_mac(const uint8_t mac_le[6]);
 int32_t btd_send_hid_report(const uint8_t *report, int32_t len);
 int32_t btd_send_hid_output(void *unit, const uint8_t *data, int32_t len);
+int32_t btd_is_dongle_present(void);
+int32_t btd_is_connected(void);
+const char *btd_get_status_str(void);
+void    btd_set_paused(uint8_t paused);
+void    btd_disconnect(void);
+int32_t btd_rescan_dongle(void);
 
 #endif /* __BT_DONGLE_H__ */

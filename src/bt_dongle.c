@@ -69,6 +69,7 @@ typedef struct {
   btd_fsm_state_t state;
   int32_t timer;
   int32_t conn_timer;
+  int32_t l2cap_timer;
 
   uint8_t dongle_bdaddr[6];
   uint8_t target_bdaddr[6];
@@ -107,9 +108,26 @@ typedef struct {
   void *swpro_unit;
 
   volatile uint8_t closing;
+  volatile uint8_t paused;
+  volatile uint8_t rescan_pending;
+  uint8_t l2cap_fail_count;
 } btd_context_t;
 
 static btd_context_t btd;
+static sys_mutex_t s_btd_mutex;
+static volatile uint8_t s_btd_mutex_ok = 0;
+
+static inline void btd_lock(void) {
+  if (s_btd_mutex_ok) {
+    sys_mutex_lock(s_btd_mutex, 0);
+  }
+}
+
+static inline void btd_unlock(void) {
+  if (s_btd_mutex_ok) {
+    sys_mutex_unlock(s_btd_mutex);
+  }
+}
 
 /* Realtek firmware download state */
 static int32_t s_rtl_fd = -1;
@@ -234,6 +252,14 @@ int32_t btd_attach(int32_t dev_id) {
   if (cdesc == NULL) {
     xlog("BTD attach failed: no configuration descriptor");
     return CELL_USBD_ATTACH_FAILED;
+  }
+
+  if (!s_btd_mutex_ok) {
+    sys_mutex_attribute_t mattr;
+    sys_mutex_attribute_initialize(mattr);
+    if (sys_mutex_create(&s_btd_mutex, &mattr) == CELL_OK) {
+      s_btd_mutex_ok = 1;
+    }
   }
 
   /* Find Bluetooth interface (Class 0xE0, Subclass 0x01, Protocol 0x01) */
@@ -556,8 +582,10 @@ static void btd_log_mac_addr(const char *prefix, const uint8_t *mac) {
 
 /* HCI Event Reception on Interrupt IN Pipe EP 0x81 */
 static void btd_evt_done(int32_t result, int32_t count, void *arg) {
+  btd_lock();
   btd.evt_busy = 0;
   if (result != CELL_OK || btd.closing) {
+    btd_unlock();
     return;
   }
 
@@ -587,7 +615,7 @@ static void btd_evt_done(int32_t result, int32_t count, void *arg) {
           } else if (op == 0xFC20 && status == 0) {
             btd.cmd_complete = 1;
             btd_rtl_send_next_chunk();
-          } else if (op == HCI_OP_READ_BD_ADDR && status == 0) {
+          } else if (op == HCI_OP_READ_BD_ADDR && status == 0 && count >= 12) {
             memcpy(btd.dongle_bdaddr, &p[4], 6);
             btd_log_mac_addr("BTD: dongle BD_ADDR ", btd.dongle_bdaddr);
             btd.cmd_complete = 1;
@@ -616,6 +644,10 @@ static void btd_evt_done(int32_t result, int32_t count, void *arg) {
 
       case HCI_EVT_CONN_REQUEST: {
         if (count >= 8) {
+          if (btd.paused) {
+            xlog("BTD: Incoming connection ignored (wired mode active)");
+            break;
+          }
           /* Incoming connection request from gamepad */
           uint8_t accept_params[7];
           memcpy(&accept_params[0], &p[0], 6);
@@ -627,10 +659,14 @@ static void btd_evt_done(int32_t result, int32_t count, void *arg) {
       }
 
       case HCI_EVT_CONN_COMPLETE: {
+        if (count < 5) {
+          break;
+        }
         uint8_t status = p[0];
         if (status == 0x00) {
           btd.acl_handle = p[1] | ((p[2] & 0x0F) << 8);
           btd.state = BTD_STATE_ACL_CONNECTED;
+          btd.l2cap_timer = 500; /* 5.0s handshake watchdog */
           xlog("BTD: ACL connected");
 
           /* Start continuous ACL bulk reading */
@@ -642,7 +678,12 @@ static void btd_evt_done(int32_t result, int32_t count, void *arg) {
           btd.state = BTD_STATE_L2CAP_OPENING_CTRL;
         } else {
           static uint8_t s_direct_try_count = 0;
-          if (++s_direct_try_count >= 3) {
+          if (btd.rescan_pending) {
+            btd.rescan_pending = 0;
+            s_direct_try_count = 0;
+            btd.state = BTD_STATE_INQUIRY;
+            btd.timer = 0;
+          } else if (++s_direct_try_count >= 3) {
             s_direct_try_count = 0;
             btd.state = BTD_STATE_INQUIRY;
             btd.timer = 0;
@@ -664,8 +705,14 @@ static void btd_evt_done(int32_t result, int32_t count, void *arg) {
         btd.acl_handle = 0xFFFF;
         btd.ctrl_rcid = 0;
         btd.intr_rcid = 0;
-        btd.state = BTD_STATE_READY;
-        btd.timer = 100; /* Retry in 1 second */
+        if (btd.rescan_pending) {
+          btd.rescan_pending = 0;
+          btd.state = BTD_STATE_INQUIRY;
+          btd.timer = 0;
+        } else {
+          btd.state = BTD_STATE_READY;
+          btd.timer = 100; /* Retry in 1 second */
+        }
         break;
       }
 
@@ -731,7 +778,12 @@ static void btd_evt_done(int32_t result, int32_t count, void *arg) {
           }
           btd_log_mac_addr("BTD: Found device in inquiry scan: ", bd);
           xlog_code("BTD: Device CoD", (int32_t)cod);
-          xlog("BTD: Connecting to discovered device...");
+          if (((cod >> 8) & 0x1F) != 0x05) {
+            xlog("BTD: Ignoring non-controller device (CoD major != Peripheral)");
+            break;
+          }
+          xlog("BTD: Connecting to discovered controller...");
+          btd.l2cap_fail_count = 0;
           memcpy(btd.target_bdaddr, bd, 6);
           btd_learn_controller_mac(bd);
           btd_queue_cmd(HCI_OP_INQUIRY_CANCEL, 0, NULL);
@@ -753,6 +805,7 @@ static void btd_evt_done(int32_t result, int32_t count, void *arg) {
     btd.evt_busy = 1;
     cellUsbdInterruptTransfer(btd.i_pipe, btd.evt_buf, sizeof(btd.evt_buf), btd_evt_done, &btd);
   }
+  btd_unlock();
 }
 
 /* L2CAP Helpers and ACL Bulk Transmission */
@@ -924,6 +977,7 @@ static void btd_acl_in_done(int32_t result, int32_t count, void *arg) {
               btd.local_conf_intr = 1;
               /* Both channels open! Switch Pro Bluetooth is ACTIVE */
               btd.state = BTD_STATE_HID_ACTIVE;
+        btd.l2cap_fail_count = 0;
               xlog("BTD: HID interrupt channel opened and active!");
 
               if (btd.swpro_unit == NULL) {
@@ -948,10 +1002,11 @@ static void btd_acl_in_done(int32_t result, int32_t count, void *arg) {
         }
 
         if (rep != NULL) {
-          static uint32_t s_in_count = 0;
-          if (s_in_count++ == 0 || (s_in_count % 300) == 0) {
-            xlog_code("BTD: HID input report ID", (int32_t)rep[0]);
-            xlog_code("BTD: HID input report len", rlen);
+          static uint8_t s_in_logged = 0;
+          if (!s_in_logged) {
+            s_in_logged = 1;
+            xlog_code("BTD: First HID input report ID", (int32_t)rep[0]);
+            xlog_code("BTD: First HID input report len", rlen);
           }
           if (btd.swpro_unit != NULL) {
             btd_push_report(btd.swpro_unit, rep, rlen);
@@ -995,11 +1050,15 @@ int32_t btd_send_hid_output(void *unit, const uint8_t *data, int32_t len) {
   return btd_send_hid_report(data, len);
 }
 
+static void btd_disconnect_locked(void);
+
 /* Polling tick driven from main.c xpadd_thread (every 10ms) */
 void btd_poll_tick(void) {
+  btd_lock();
   btd_process_cmd_queue();
 
   if (btd.cmd_busy) {
+    btd_unlock();
     return;
   }
 
@@ -1060,9 +1119,27 @@ void btd_poll_tick(void) {
     }
 
     case BTD_STATE_READY: {
+      if (btd.paused) {
+        break;
+      }
       if (btd.timer > 0) {
         btd.timer--;
       } else {
+        /* Skip direct connect if no controller MAC has been learned yet (all 00 or FF) */
+        uint8_t valid_mac = 0;
+        int m;
+        for (m = 0; m < 6; m++) {
+          if (btd.target_bdaddr[m] != 0x00 && btd.target_bdaddr[m] != 0xFF) {
+            valid_mac = 1;
+            break;
+          }
+        }
+        if (!valid_mac) {
+          btd.state = BTD_STATE_INQUIRY;
+          btd.timer = 0;
+          break;
+        }
+
         /* Direct Connection to stored controller BD_ADDR (wire little-endian format) */
         uint8_t conn_params[13];
         memcpy(&conn_params[0], btd.target_bdaddr, 6);
@@ -1078,7 +1155,7 @@ void btd_poll_tick(void) {
         btd_log_mac_addr("BTD: Direct connection to BD_ADDR: ", &conn_params[0]);
         btd_send_cmd_direct(HCI_OP_CREATE_CONN, 13, conn_params);
         btd.state = BTD_STATE_CONNECTING;
-        btd.conn_timer = 600; /* 6.0 seconds timeout */
+        btd.conn_timer = 300; /* 3.0 seconds timeout */
       }
       break;
     }
@@ -1099,10 +1176,10 @@ void btd_poll_tick(void) {
       if (btd.timer > 0) {
         btd.timer--;
         if (btd.timer == 0) {
-          xlog("BTD: Inquiry scan timeout, switching to direct connect");
+          xlog("BTD: Inquiry scan timeout, listening before direct connect");
           btd_queue_cmd(HCI_OP_INQUIRY_CANCEL, 0, NULL);
           btd.state = BTD_STATE_READY;
-          btd.timer = 10;
+          btd.timer = 150; /* 1.5s free listen window for incoming controller connection */
         }
       } else {
         uint8_t inq_params[5] = {0x33, 0x8B, 0x9E, 0x03, 0x00}; /* GIAC, 3.84s window */
@@ -1116,7 +1193,28 @@ void btd_poll_tick(void) {
     case BTD_STATE_INQUIRY_CANCEL: {
       if (btd.cmd_complete) {
         btd.state = BTD_STATE_READY;
-        btd.timer = 10;
+        btd.timer = 150;
+      }
+      break;
+    }
+
+    case BTD_STATE_ACL_CONNECTED:
+    case BTD_STATE_L2CAP_OPENING_CTRL:
+    case BTD_STATE_L2CAP_CONFIG_CTRL:
+    case BTD_STATE_L2CAP_OPENING_INTR:
+    case BTD_STATE_L2CAP_CONFIG_INTR: {
+      if (btd.l2cap_timer > 0) {
+        btd.l2cap_timer--;
+      } else {
+        btd.l2cap_fail_count++;
+        xlog("BTD: L2CAP handshake timeout, resetting link for auto-retry");
+        if (btd.l2cap_fail_count >= 2) {
+          btd.l2cap_fail_count = 0;
+          btd.rescan_pending = 1; /* Fall back to Inquiry after repeated L2CAP timeouts */
+        }
+        btd_disconnect_locked();
+        btd.state = BTD_STATE_READY;
+        btd.timer = 20;
       }
       break;
     }
@@ -1124,4 +1222,109 @@ void btd_poll_tick(void) {
     default:
       break;
   }
+  btd_unlock();
+}
+
+static void btd_disconnect_locked(void) {
+  if (btd.acl_handle != 0xFFFF && !btd.closing) {
+    uint8_t params[3];
+    params[0] = (uint8_t)(btd.acl_handle & 0xFF);
+    params[1] = (uint8_t)((btd.acl_handle >> 8) & 0xFF);
+    params[2] = 0x13; /* Remote User Terminated Connection */
+    btd_queue_cmd(HCI_OP_DISCONNECT, 3, params);
+    xlog("BTD: User requested ACL disconnect");
+  }
+}
+
+int32_t btd_is_dongle_present(void) {
+  return (btd.state != BTD_STATE_IDLE && !btd.closing) ? 1 : 0;
+}
+
+int32_t btd_is_connected(void) {
+  return (btd.state == BTD_STATE_HID_ACTIVE && btd.swpro_unit != NULL) ? 1 : 0;
+}
+
+const char *btd_get_status_str(void) {
+  if (btd.state == BTD_STATE_IDLE || btd.closing) {
+    return "NONE";
+  }
+  if (btd.paused) {
+    return "PAUSED (WIRED)";
+  }
+  if (btd.state == BTD_STATE_HID_ACTIVE) {
+    return "CONNECTED";
+  }
+  if (btd.state == BTD_STATE_INQUIRY || btd.state == BTD_STATE_INQUIRY_CANCEL) {
+    return "SCANNING...";
+  }
+  if (btd.state == BTD_STATE_CONNECTING || btd.state >= BTD_STATE_ACL_CONNECTED) {
+    return "CONNECTING";
+  }
+  if (btd.state == BTD_STATE_READY) {
+    return "READY";
+  }
+  return "INIT";
+}
+
+void btd_set_paused(uint8_t paused) {
+  btd_lock();
+  uint8_t new_paused = paused ? 1 : 0;
+  uint8_t was_paused = btd.paused;
+  btd.paused = new_paused;
+  if (btd.paused) {
+    btd.rescan_pending = 0;
+    if (btd.state == BTD_STATE_INQUIRY) {
+      btd_queue_cmd(HCI_OP_INQUIRY_CANCEL, 0, NULL);
+      btd.state = BTD_STATE_READY;
+      btd.timer = 10;
+    } else if (btd.state == BTD_STATE_CONNECTING) {
+      btd_queue_cmd(HCI_OP_CREATE_CONN_CANCEL, 6, btd.target_bdaddr);
+      btd.state = BTD_STATE_READY;
+      btd.timer = 10;
+    }
+  } else if (was_paused) {
+    if (btd.state == BTD_STATE_READY) {
+      btd.timer = 2;
+    }
+  }
+  btd_unlock();
+}
+
+void btd_disconnect(void) {
+  btd_lock();
+  btd_disconnect_locked();
+  btd_unlock();
+}
+
+int32_t btd_rescan_dongle(void) {
+  btd_lock();
+  if (btd.state == BTD_STATE_IDLE || btd.closing) {
+    btd_unlock();
+    return -1;
+  }
+  btd.paused = 0;
+  if (btd.state == BTD_STATE_INQUIRY || btd.state == BTD_STATE_INQUIRY_CANCEL) {
+    btd_unlock();
+    return 0;
+  }
+  if (btd.acl_handle != 0xFFFF) {
+    btd.rescan_pending = 1;
+    btd_disconnect_locked();
+    btd_unlock();
+    return 0;
+  }
+  if (btd.state == BTD_STATE_CONNECTING) {
+    btd.rescan_pending = 1;
+    btd_queue_cmd(HCI_OP_CREATE_CONN_CANCEL, 6, btd.target_bdaddr);
+    btd_unlock();
+    return 0;
+  }
+  if (btd.state >= BTD_STATE_READY) {
+    btd.state = BTD_STATE_INQUIRY;
+    btd.timer = 0;
+    btd_unlock();
+    return 0;
+  }
+  btd_unlock();
+  return -1;
 }
