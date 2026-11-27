@@ -92,16 +92,18 @@ static void test_toggle_and_latch(void) {
 
   /* While held (non-zero before release), input must be ignored */
   xmb_ui_handle_input(UI_NAV_DOWN);
-  ASSERT_TRUE(xmb_ui_get_selected() == 0, "Held input before release does not move cursor");
+  ASSERT_TRUE(xmb_ui_get_selected() == UI_ITEM_SWITCH_LAYOUT, "Held input before release does not move cursor");
 
   /* Release clears latch */
   xmb_ui_handle_input(0);
   press_nav(UI_NAV_DOWN);
-  ASSERT_TRUE(xmb_ui_get_selected() == 1, "Down moves selection to item 1");
+  ASSERT_TRUE(xmb_ui_get_selected() == UI_ITEM_SWITCH_LAYOUT + 1, "Down moves selection to next item");
 
   press_nav(UI_NAV_UP);
-  ASSERT_TRUE(xmb_ui_get_selected() == 0, "Up moves selection back to item 0");
+  ASSERT_TRUE(xmb_ui_get_selected() == UI_ITEM_SWITCH_LAYOUT, "Up moves selection back to default item");
 
+  press_nav(UI_NAV_UP);
+  press_nav(UI_NAV_UP);
   press_nav(UI_NAV_UP);
   ASSERT_TRUE(xmb_ui_get_selected() == UI_ITEM_COUNT - 1, "Up wraps around to last item");
 
@@ -119,7 +121,12 @@ static void test_menu_actions(void) {
   cfg = xmb_ui_get_config();
   ASSERT_TRUE(cfg->conn_mode == XPAD_CONN_BLUETOOTH, "Default connection mode is Bluetooth");
 
-  /* Item 0: Connection Mode */
+  /* Default selection starts on Switch Layout (safe against accidental BT disconnect) */
+  ASSERT_TRUE(xmb_ui_get_selected() == UI_ITEM_SWITCH_LAYOUT, "Default selection is Switch Layout");
+
+  /* Navigate up to Item 0: Connection Mode */
+  press_nav(UI_NAV_UP);
+  press_nav(UI_NAV_UP);
   press_nav(UI_NAV_CONFIRM);
   ASSERT_TRUE(cfg->conn_mode == XPAD_CONN_WIRED, "Connection mode toggled to Wired USB");
   ASSERT_TRUE(g_conn_cb_calls == 1 && g_last_conn_mode == XPAD_CONN_WIRED, "on_conn_mode_changed fired with WIRED");

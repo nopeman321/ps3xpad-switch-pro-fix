@@ -144,141 +144,159 @@ static void forward_actuator(uint32_t port_no, const CellPadActParam *param) {
 }
 
 // ---------------------------------------------------------------------------
-// cellPadSetActDirect hook
+// PPC64 OPD-table detour helpers & pad hooks
 //
-// A game-agnostic detour: overwrite the first few instructions of the resolved
-// cellPadSetActDirect entry with a jump to our thunk, so every caller in the
-// process is redirected regardless of which module issued the call. The thunk
-// fixes up the TOC (r2) for our C hook; the trampoline replays the displaced
-// instructions and jumps back so the original still runs.
+// A game-agnostic detour: resolve the target function's real module OPD
+// {entry, toc} via its .sceStub.text stub, save the original {entry, toc} into
+// h->orig_opd, and atomically overwrite the target module's OPD with our C
+// hook's {entry, toc}.
+//
+// Why OPD patching instead of .text patching:
+//   1. Every caller in the process (EBOOT.BIN + all PRXs) dispatches through
+//      the target module's OPD, so patching it redirects all callers.
+//   2. A PRX's .opd lives in its RW- data segment, whereas .text is R-E
+//      (write-protected on PS3HEN, causing a DSI fault if written via memcpy).
+//   3. No code is generated in .bss (avoiding NX/ISI faults) and no icache
+//      flush is needed.
 // ---------------------------------------------------------------------------
 
+// Standard PS3 DualShock 3 capability flags advertised for spoofed LDD ports
+#define DS3_SPOOF_CAPABILITIES \
+  (CELL_PAD_CAPABILITY_PS3_CONFORMITY | \
+   CELL_PAD_CAPABILITY_PRESS_MODE | \
+   CELL_PAD_CAPABILITY_SENSOR_MODE | \
+   CELL_PAD_CAPABILITY_HP_ANALOG_STICK | \
+   CELL_PAD_CAPABILITY_ACTUATOR)
+
 typedef int32_t (*padact_fn)(uint32_t, CellPadActParam *);
+typedef int32_t (*padgetinfo2_fn)(CellPadInfo2 *);
+typedef int32_t (*padgetdataextra_fn)(uint32_t, uint32_t *, CellPadData *);
 
-#define STEAL 4 // instructions displaced from the target prologue
+// Reusable hook state.
+typedef struct {
+  uint32_t *target_opd;                              // resolved module OPD in RW- .opd
+  uint32_t  orig_opd[2] __attribute__((aligned(8))); // saved {orig_entry, orig_toc}
+  int32_t   installed;
+} pad_hook_t;
 
-static uint32_t *g_target;              // resolved cellPadSetActDirect entry (code)
-static uint32_t  g_saved[STEAL];        // original instructions, for restore
-// g_thunk/g_tramp hold generated code executed via bctr. They live in the
-// module's data; PS3 lv2 processes execute data/heap freely, but if a target
-// CFW enforces W^X these two need to move to exec memory - the one seam beyond
-// the code-write below that a hardware bring-up may have to adjust.
-static uint32_t  g_thunk[8];            // entry fixup: set our TOC, jump to hook
-static uint32_t  g_tramp[16];           // set orig TOC, replay prologue, jump back
-static uint32_t  g_orig_opd[2] __attribute__((aligned(8))); // {g_tramp, orig TOC}
-static int32_t   g_hook_installed;
+static pad_hook_t g_setActDirect_hook;
+static pad_hook_t g_getInfo2_hook;
+static pad_hook_t g_getDataExtra_hook;
 
-// emit a 4-instruction absolute jump to 'addr' using the volatile r11:
-//   lis r11,addr@h ; ori r11,r11,addr@l ; mtctr r11 ; bctr
-// r11 is a standard volatile scratch/trampoline register under the PPC64 ELF ABI.
-// Using r11 instead of r0 avoids clobbering r0, which standard PPC64 prologues
-// use to hold the link register (mflr r0; std r0, 16(r1)) before saving it to stack.
-// Valid for PS3 user addresses (< 0x8000_0000, so lis does not sign-extend high).
-static void emit_jump_r11(uint32_t *out, uint32_t addr) {
-  out[0] = 0x3D600000u | (addr >> 16);    // lis   r11, addr@h
-  out[1] = 0x616B0000u | (addr & 0xFFFF); // ori   r11, r11, addr@l
-  out[2] = 0x7D6903A6u;                   // mtctr r11
-  out[3] = 0x4E800420u;                   // bctr
+// Resolve a target function pointer to its real module OPD {entry, toc}.
+// In a PS3 PRX linked against *_stub, taking &imported_func yields the address
+// of its .sceStub.text stub rather than an OPD:
+//   li   r12, seg@l       (0x3980xxxx)
+//   oris r12, r12, seg@h  (0x658Cxxxx)
+//   lwz  r12, disp(r12)   (0x818Cxxxx)
+// which loads the resolved module OPD pointer from .data.sceFStub.
+// Returns NULL (fail-closed) if the pointer is NULL or the import is unresolved.
+static uint32_t *resolve_target_opd(void *target_func) {
+  uint32_t *p = (uint32_t *)target_func;
+
+  if (p == NULL) {
+    return NULL;
+  }
+  if ((p[0] & 0xFFFF0000u) == 0x39800000u &&
+      (p[1] & 0xFFFF0000u) == 0x658C0000u &&
+      (p[2] & 0xFFFF0000u) == 0x818C0000u) {
+    uint32_t r12 = (uint32_t)(int32_t)(int16_t)(p[0] & 0xFFFFu);
+    uint32_t stub_entry_addr;
+    uint32_t *opd;
+
+    r12 |= ((uint32_t)(p[1] & 0xFFFFu)) << 16;
+    stub_entry_addr = r12 + (uint32_t)(int32_t)(int16_t)(p[2] & 0xFFFFu);
+    if (stub_entry_addr == 0) {
+      return NULL;
+    }
+    opd = *(uint32_t **)(uintptr_t)stub_entry_addr;
+    if (opd == NULL || opd == p) {
+      return NULL;
+    }
+    return opd;
+  }
+  return p;
 }
 
-// Backward-compatible alias for emit_jump_r0
-static inline void emit_jump_r0(uint32_t *out, uint32_t addr) {
-  emit_jump_r11(out, addr);
-}
-
-// emit lis/ori loading 'val' into r2 (the TOC pointer) at out[0..1]
-static void emit_load_r2(uint32_t *out, uint32_t val) {
-  out[0] = 0x3C400000u | (val >> 16);     // lis r2, val@h
-  out[1] = 0x60420000u | (val & 0xFFFF);  // ori r2, r2, val@l
-}
-
-// flush the instruction cache over a range we just wrote code into - the
-// correct data-cache-store / instruction-cache-invalidate sequence for
-// self-modifying code on PPC.
-static void icache_flush(void *addr, int32_t len) {
-  uint8_t *p = (uint8_t *)addr;
-  int32_t i;
-
-  for (i = 0; i < len; i += 4) {
-    __asm__ __volatile__("dcbst 0,%0" :: "r"(p + i) : "memory");
+// Write an {entry, toc} pair into an OPD slot (atomically when 8-byte aligned).
+static void write_opd(uint32_t *dst_opd, uint32_t entry, uint32_t toc) {
+  if (((uintptr_t)dst_opd & 7u) == 0) {
+    *(volatile uint64_t *)dst_opd = ((uint64_t)entry << 32) | (uint64_t)toc;
+  } else {
+    dst_opd[0] = entry;
+    dst_opd[1] = toc;
   }
   __asm__ __volatile__("sync" ::: "memory");
-  for (i = 0; i < len; i += 4) {
-    __asm__ __volatile__("icbi 0,%0" :: "r"(p + i) : "memory");
-  }
-  __asm__ __volatile__("isync" ::: "memory");
 }
 
-// The hook. Runs with the correct TOC (set by g_thunk). Forwards the rumble
-// values, then calls the original through the trampoline so the game's pad
-// handling is unchanged.
-static int32_t hook_padSetActDirect(uint32_t port_no, CellPadActParam *param) {
-  forward_actuator(port_no, param);
-  return ((padact_fn)(void *)g_orig_opd)(port_no, param);
-}
-
-// install the detour. Returns 0 on success. Fails closed: on any error the
-// original function is left untouched and rumble is simply unavailable.
-static int32_t install_hook(void) {
+// Install a PPC64 OPD detour. Returns 0 on success, -1 on failure.
+// Fails closed: on any error the target OPD is left untouched.
+static int32_t install_pad_hook(pad_hook_t *h, void *target_func, void *hook_func) {
   uint32_t *tgt_opd, *hook_opd;
-  uint32_t  orig_toc, our_toc, hook_entry;
 
-  // OPDs: a PS3 function pointer is {entry, toc}. Our resolved import gives us
-  // the real cellPadSetActDirect entry/TOC; &hook gives our own.
-  tgt_opd  = (uint32_t *)(void *)cellPadSetActDirect;
-  hook_opd = (uint32_t *)(void *)hook_padSetActDirect;
+  if (h == NULL || target_func == NULL || hook_func == NULL) {
+    return -1;
+  }
+  if (h->installed) {
+    return 0;
+  }
+
+  tgt_opd  = resolve_target_opd(target_func);
+  hook_opd = (uint32_t *)hook_func;
   if (tgt_opd == NULL || hook_opd == NULL) {
     return -1;
   }
-  g_target   = (uint32_t *)tgt_opd[0];
-  orig_toc   = tgt_opd[1];
-  hook_entry = hook_opd[0];
-  our_toc    = hook_opd[1];
-  if (g_target == NULL) {
+  if (tgt_opd[0] == 0 || tgt_opd[1] == 0 || hook_opd[0] == 0 || hook_opd[1] == 0) {
     return -1;
   }
 
-  // save the instructions we are about to overwrite (for the trampoline and
-  // for restore on unload)
-  memcpy(g_saved, g_target, sizeof(g_saved));
+  h->target_opd  = tgt_opd;
+  h->orig_opd[0] = tgt_opd[0];
+  h->orig_opd[1] = tgt_opd[1];
 
-  // thunk: land here from the patched entry, set our TOC, jump to the C hook
-  emit_load_r2(g_thunk, our_toc);
-  emit_jump_r11(g_thunk + 2, hook_entry);
+  write_opd(tgt_opd, hook_opd[0], hook_opd[1]);
 
-  // trampoline (the "original"): set the original TOC, replay the displaced
-  // prologue, then jump back into the function just past the patch
-  emit_load_r2(g_tramp, orig_toc);
-  memcpy(g_tramp + 2, g_saved, sizeof(g_saved));
-  emit_jump_r11(g_tramp + 2 + STEAL, (uint32_t)(uintptr_t)(g_target + STEAL));
-  g_orig_opd[0] = (uint32_t)(uintptr_t)g_tramp;
-  g_orig_opd[1] = orig_toc;
-
-  // publish the thunk/trampoline code before anything can branch into it
-  // (g_orig_opd is plain data read by the call sequence, so it needs no flush)
-  icache_flush(g_thunk, sizeof(g_thunk));
-  icache_flush(g_tramp, sizeof(g_tramp));
-
-  // redirect the entry to the thunk. This writes into the resolved function's
-  // code; on a CFW that allows in-process code writes (the norm - the plugin
-  // itself was injected the same way) this takes effect immediately.
-  {
-    uint32_t patch[STEAL];
-    emit_jump_r11(patch, (uint32_t)(uintptr_t)g_thunk);
-    memcpy(g_target, patch, sizeof(patch));
-    icache_flush(g_target, sizeof(patch));
-  }
-
-  g_hook_installed = 1;
+  h->installed = 1;
   return 0;
 }
 
-static void remove_hook(void) {
-  if (g_hook_installed && g_target != NULL) {
-    memcpy(g_target, g_saved, sizeof(g_saved));
-    icache_flush(g_target, sizeof(g_saved));
-    g_hook_installed = 0;
+static void remove_pad_hook(pad_hook_t *h) {
+  if (h != NULL && h->installed && h->target_opd != NULL) {
+    write_opd(h->target_opd, h->orig_opd[0], h->orig_opd[1]);
+    h->installed = 0;
   }
+}
+
+// Forward rumble actuator values, then call original cellPadSetActDirect.
+static int32_t hook_padSetActDirect(uint32_t port_no, CellPadActParam *param) {
+  forward_actuator(port_no, param);
+  return ((padact_fn)(void *)g_setActDirect_hook.orig_opd)(port_no, param);
+}
+
+// Spoof connected LDD pads as standard DualShock 3 controllers in CellPadInfo2.
+// Real hardware DS3/STANDARD, BD remote, and disconnected ports are untouched.
+static int32_t hook_padGetInfo2(CellPadInfo2 *info) {
+  int32_t ret = ((padgetinfo2_fn)(void *)g_getInfo2_hook.orig_opd)(info);
+  if (ret == CELL_OK && info != NULL) {
+    uint32_t i;
+    for (i = 0; i < CELL_PAD_MAX_PORT_NUM; i++) {
+      if ((info->port_status[i] & CELL_PAD_STATUS_CONNECTED) &&
+          info->device_type[i] == CELL_PAD_DEV_TYPE_LDD) {
+        info->device_type[i] = CELL_PAD_DEV_TYPE_STANDARD;
+        info->device_capability[i] = DS3_SPOOF_CAPABILITIES;
+      }
+    }
+  }
+  return ret;
+}
+
+// Spoof LDD device_type reported by cellPadGetDataExtra as standard DS3.
+static int32_t hook_padGetDataExtra(uint32_t port_no, uint32_t *device_type, CellPadData *data) {
+  int32_t ret = ((padgetdataextra_fn)(void *)g_getDataExtra_hook.orig_opd)(port_no, device_type, data);
+  if (ret >= 0 && device_type != NULL && *device_type == CELL_PAD_DEV_TYPE_LDD) {
+    *device_type = CELL_PAD_DEV_TYPE_STANDARD;
+  }
+  return ret;
 }
 
 // ---------------------------------------------------------------------------
@@ -294,14 +312,19 @@ int xpad_game_start(uint64_t arg) {
   g_send_mutex_ok = (sys_mutex_create(&g_send_mutex, &mattr) == CELL_OK) ? 1 : 0;
 
   // connect lazily on the first actuator change (rumble_send), so load order
-  // versus the VSH driver does not matter. Install the hook now.
-  install_hook();
+  // versus the VSH driver does not matter. Install the hooks now; each hook
+  // fails closed independently if its target cannot be patched.
+  install_pad_hook(&g_setActDirect_hook, (void *)cellPadSetActDirect, (void *)hook_padSetActDirect);
+  install_pad_hook(&g_getInfo2_hook, (void *)cellPadGetInfo2, (void *)hook_padGetInfo2);
+  install_pad_hook(&g_getDataExtra_hook, (void *)cellPadGetDataExtra, (void *)hook_padGetDataExtra);
 
   return SYS_PRX_RESIDENT;
 }
 
 int xpad_game_stop(void) {
-  remove_hook();
+  remove_pad_hook(&g_getDataExtra_hook);
+  remove_pad_hook(&g_getInfo2_hook);
+  remove_pad_hook(&g_setActDirect_hook);
   if (g_send_mutex_ok) {
     sys_mutex_lock(g_send_mutex, 0);
     rumble_disconnect();

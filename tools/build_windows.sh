@@ -77,7 +77,16 @@ done
 echo
 echo "=== signing ==="
 sign_and_report "$ROOT/src"  xpad
-sign_and_report "$ROOT/game" xpad_game
+
+echo
+echo "--- fake-signing xpad_game.sprx (make_fself) ---"
+make_fself "$ROOT/game/xpad_game.prx" "$ROOT/game/xpad_game.sprx"
+if [ -f "$ROOT/game/xpad_game.sprx" ]; then
+    echo "    OK: xpad_game.sprx ($(wc -c < "$ROOT/game/xpad_game.sprx") bytes)"
+else
+    echo "    FAILED to produce xpad_game.sprx" >&2
+    exit 1
+fi
 
 echo
 echo "=== done ==="

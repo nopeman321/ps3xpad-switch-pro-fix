@@ -157,6 +157,7 @@ void xmb_ui_toggle(void) {
 
 void xmb_ui_open(void) {
   s_ui.is_open = 1;
+  s_ui.selected = UI_ITEM_SWITCH_LAYOUT;
   s_ui.dirty = 1;
   s_ui.prev_nav = 0xFFFFFFFFU;
   s_ui.repeat_ticks = 0;
@@ -609,7 +610,7 @@ void xmb_ui_render_to_buffer(uint32_t *fb, uint32_t width, uint32_t height, uint
 
     /* Header title & divider */
     row_text(s_row_buf, win_w, ry, pad_x, 10 * scale,
-             "XPAD://TERM_UI  [PURPLE EDITION]", UI_COL_TEXT, scale);
+             "XPAD://TERM_UI", UI_COL_TEXT, scale);
     row_fill(s_row_buf, win_w, ry, 2 * scale, y_cur, win_w - 4 * scale, scale, UI_COL_BORDER);
 
     /* Live status bar */

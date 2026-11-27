@@ -162,6 +162,8 @@
 #define SYSCALL8_OPCODE_PS3MAPI            0x7777ULL
 #define PS3MAPI_OPCODE_GET_ALL_PROC_PID    0x0021ULL
 #define PS3MAPI_OPCODE_GET_PROC_NAME_BY_PID 0x0022ULL
+#define PS3MAPI_OPCODE_GET_PROC_MEM        0x0031ULL
+#define PS3MAPI_OPCODE_SET_PROC_MEM        0x0032ULL
 #define PS3MAPI_OPCODE_LOAD_PROC_MODULE    0x0044ULL
 #define PS3MAPI_MAX_PROC 16 // == Mamba MAX_PROCESS; kernel fills exactly this many
 #endif
@@ -1694,6 +1696,448 @@ static int32_t ps3mapi_load_module(uint32_t pid, const char *path) {
   return (int32_t)p1;
 }
 
+static int32_t ps3mapi_get_proc_mem(uint32_t pid, uint64_t addr, void *buf, uint32_t size) {
+  system_call_6(8, (uint64_t)SYSCALL8_OPCODE_PS3MAPI, (uint64_t)PS3MAPI_OPCODE_GET_PROC_MEM,
+                (uint64_t)(uint32_t)pid, addr, (uint64_t)(uintptr_t)buf, (uint64_t)size);
+  return (int32_t)p1;
+}
+
+static int32_t ps3mapi_set_proc_mem(uint32_t pid, uint64_t addr, const void *buf, uint32_t size) {
+  system_call_6(8, (uint64_t)SYSCALL8_OPCODE_PS3MAPI, (uint64_t)PS3MAPI_OPCODE_SET_PROC_MEM,
+                (uint64_t)(uint32_t)pid, addr, (uint64_t)(uintptr_t)buf, (uint64_t)size);
+  return (int32_t)p1;
+}
+
+// ---------------------------------------------------------------------------
+// PS3MAPI in-memory DS3 spoofing (GET_PROC_MEM / SET_PROC_MEM)
+//
+// On PS3HEN 3.6.0, LOAD_PROC_MODULE wedges the kernel PRX loader, so we patch
+// cellPadGetInfo2 and cellPadGetDataExtra directly in the game process's
+// libio.sprx via PS3MAPI GET_PROC_MEM / SET_PROC_MEM.
+// ---------------------------------------------------------------------------
+static uint8_t auto_inject_prx_enabled = 0;
+static volatile uint32_t g_active_game_pid = 0;
+static volatile uint8_t g_manual_spoof_req = 0;
+static volatile uint8_t stop_requested = 0;
+static uint32_t s_pending_ui_nav = 0;
+static uint8_t s_has_pending_ui_nav = 0;
+static XPAD_UNIT_t *s_pending_ui_unit = NULL;
+
+static void swpro_handle_capture_btn(XPAD_UNIT_t *unit, uint8_t star_now) {
+  if (unit == NULL) {
+    return;
+  }
+  if (star_now && !unit->swpro_star_prev) {
+    if (g_active_game_pid != 0) {
+      if (xmb_ui_is_open()) {
+        xmb_ui_close();
+      }
+      g_manual_spoof_req = 1;
+    } else {
+      uint8_t was_open = xmb_ui_is_open();
+      xmb_ui_toggle();
+      if (was_open && !xmb_ui_is_open()) {
+        unit->swpro_post_close_guard = 1;
+      }
+    }
+  }
+  unit->swpro_star_prev = star_now;
+}
+
+static void xlog_addr(const char *what, uint32_t addr) {
+  char msg[192], *m;
+
+  if (!log_ok) {
+    return;
+  }
+  m = msg;
+  m = append_strn(m, what, 150);
+  m = append_str(m, " 0x");
+  m = append_hex32(m, addr);
+  xlog(msg);
+}
+
+static uint32_t *resolve_vsh_opd(void *target_func) {
+  uint32_t *p = (uint32_t *)target_func;
+
+  if (p == NULL) {
+    return NULL;
+  }
+  if ((p[0] & 0xFFFF0000u) == 0x39800000u &&
+      (p[1] & 0xFFFF0000u) == 0x658C0000u &&
+      (p[2] & 0xFFFF0000u) == 0x818C0000u) {
+    uint32_t r12 = (uint32_t)(int32_t)(int16_t)(p[0] & 0xFFFFu);
+    uint32_t stub_entry_addr;
+    uint32_t *opd;
+
+    r12 |= ((uint32_t)(p[1] & 0xFFFFu)) << 16;
+    stub_entry_addr = r12 + (uint32_t)(int32_t)(int16_t)(p[2] & 0xFFFFu);
+    if (stub_entry_addr == 0) {
+      return NULL;
+    }
+    opd = *(uint32_t **)(uintptr_t)stub_entry_addr;
+    if (opd == NULL || opd == p) {
+      return NULL;
+    }
+    return opd;
+  }
+  return p;
+}
+
+static inline int32_t insn_match(uint32_t a, uint32_t b) {
+  if (a == b) {
+    return 1;
+  }
+  // Allow differing 16-bit TOC displacements on r2-relative D-form instructions
+  if (((a ^ b) & 0xFFFF0000u) == 0 && (a & 0x001F0000u) == 0x00020000u) {
+    return 1;
+  }
+  return 0;
+}
+
+static int32_t sig_match(const uint32_t *buf, const uint32_t *sig, uint32_t n) {
+  uint32_t k;
+  for (k = 0; k < n; k++) {
+    if (!insn_match(buf[k], sig[k])) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+static uint32_t find_game_funcs(uint32_t pid, uint32_t vsh_entry, const uint32_t *sig,
+                                uint32_t sig_words, uint32_t *out_addrs, uint32_t max_out) {
+  static uint32_t page_buf[1024 + 8];
+  uint32_t sig_bytes = sig_words * 4u;
+  uint32_t addr, i, count = 0;
+  uint32_t scan_end = 0;
+  static const uint32_t ranges[][2] = {
+    { 0x30000000u, 0x40000000u },
+    { 0x00010000u, 0x10000000u }
+  };
+  uint32_t r;
+
+  if (sig_words > 8u || vsh_entry == 0 || max_out == 0) {
+    return 0;
+  }
+  // Scan PRX/code regions in 4KB chunks (+ 32B overlap) with 4-byte alignment.
+  // Once the first match is found in libio.sprx, narrow the tail window to +64 KB.
+  for (r = 0; r < 2u; r++) {
+    uint32_t r_end = ranges[r][1];
+    for (addr = ranges[r][0]; addr < r_end; addr += 0x1000u) {
+      uint32_t read_sz;
+      int32_t mr;
+      if (stop_requested || !running) {
+        return count;
+      }
+      if (scan_end != 0 && addr > scan_end) {
+        break;
+      }
+      read_sz = (addr + 0x1020u <= r_end) ? 0x1020u : 0x1000u;
+      if ((mr = ps3mapi_get_proc_mem(pid, (uint64_t)addr, page_buf, read_sz)) != 0) {
+        if ((uint32_t)mr == 0x80010003u) {
+          return count;
+        }
+        if (read_sz > 0x1000u &&
+            ps3mapi_get_proc_mem(pid, (uint64_t)addr, page_buf, 0x1000u) != 0) {
+          continue;
+        }
+        read_sz = 0x1000u;
+      }
+      {
+        uint32_t limit = (read_sz - sig_bytes) / 4u;
+        for (i = 0; i <= limit; i++) {
+          if (insn_match(page_buf[i], sig[0]) &&
+              insn_match(page_buf[i + 1u], sig[1]) &&
+              sig_match(&page_buf[i], sig, sig_words)) {
+            uint32_t hit = addr + (i * 4u);
+            if (count == 0 || hit > out_addrs[count - 1u]) {
+              out_addrs[count++] = hit;
+              if (scan_end == 0) {
+                scan_end = hit + 0x10000u;
+              }
+              if (count >= max_out) {
+                return count;
+              }
+            }
+          }
+        }
+      }
+    }
+    if (count > 0) {
+      break;
+    }
+  }
+  return count;
+}
+
+static uint32_t find_eboot_cave(uint32_t pid, uint32_t need_bytes) {
+  uint8_t ehdr[64];
+  uint32_t phdrs[32][14];
+  uint32_t phoff, phentsize, phnum, p, q;
+  static uint8_t probe[512];
+
+  if (need_bytes > sizeof(probe)) {
+    return 0;
+  }
+  if (ps3mapi_get_proc_mem(pid, 0x00010000ULL, ehdr, sizeof(ehdr)) != 0) {
+    return 0;
+  }
+  if (ehdr[0] != 0x7Fu || ehdr[1] != 'E' || ehdr[2] != 'L' || ehdr[3] != 'F' ||
+      ehdr[4] != 2u || ehdr[5] != 2u) {
+    return 0;
+  }
+  if (ehdr[0x20] != 0 || ehdr[0x21] != 0 || ehdr[0x22] != 0 || ehdr[0x23] != 0) {
+    return 0;
+  }
+  phoff = ((uint32_t)ehdr[0x24] << 24) | ((uint32_t)ehdr[0x25] << 16) |
+          ((uint32_t)ehdr[0x26] << 8)  |  (uint32_t)ehdr[0x27];
+  phentsize = ((uint16_t)ehdr[0x36] << 8) | (uint16_t)ehdr[0x37];
+  phnum     = ((uint16_t)ehdr[0x38] << 8) | (uint16_t)ehdr[0x39];
+  if (phentsize != 56u || phnum == 0 || phnum > 32u) {
+    return 0;
+  }
+  for (p = 0; p < phnum; p++) {
+    if (ps3mapi_get_proc_mem(pid, 0x00010000ULL + (uint64_t)phoff + (uint64_t)(p * 56u),
+                             phdrs[p], sizeof(phdrs[p])) != 0) {
+      return 0;
+    }
+  }
+  for (p = 0; p < phnum; p++) {
+    uint32_t p_type  = phdrs[p][0];
+    uint32_t p_flags = phdrs[p][1];
+    uint32_t p_vaddr = phdrs[p][5];
+    uint32_t p_memsz = phdrs[p][11];
+    if (p_type == 1u && (p_flags & 1u) != 0 && phdrs[p][4] == 0 && phdrs[p][10] == 0 &&
+        p_memsz <= 0x10000000u) {
+      uint32_t seg_end = p_vaddr + p_memsz;
+      uint32_t page_end = (seg_end + 0xFFFu) & ~0xFFFu;
+      uint32_t cave = (seg_end + 15u) & ~15u;
+      uint32_t i, all_zero = 1, overlaps = 0;
+      if (cave + need_bytes > page_end || cave + need_bytes < cave) {
+        continue;
+      }
+      for (q = 0; q < phnum; q++) {
+        if (q != p && phdrs[q][0] == 1u && phdrs[q][4] == 0 && phdrs[q][10] == 0) {
+          uint32_t o_start = phdrs[q][5];
+          uint32_t o_end = o_start + phdrs[q][11];
+          if (cave < o_end && (cave + need_bytes) > o_start) {
+            overlaps = 1;
+            break;
+          }
+        }
+      }
+      if (overlaps) {
+        continue;
+      }
+      if (ps3mapi_get_proc_mem(pid, (uint64_t)cave, probe, need_bytes) == 0) {
+        for (i = 0; i < need_bytes; i++) {
+          if (probe[i] != 0) {
+            all_zero = 0;
+            break;
+          }
+        }
+        if (all_zero) {
+          return cave;
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+static uint32_t find_opd_entry(uint32_t pid, uint32_t func_addr) {
+  static uint32_t buf[1024];
+  uint32_t start = func_addr & ~0xFFFu;
+  uint32_t end = start + 0x00200000u;
+  uint32_t addr, i;
+
+  for (addr = start; addr < end; addr += 0x1000u) {
+    if (ps3mapi_get_proc_mem(pid, (uint64_t)addr, buf, sizeof(buf)) != 0) {
+      continue;
+    }
+    for (i = 0; i < 1023u; i += 2u) {
+      if (buf[i] == func_addr) {
+        uint32_t toc = buf[i + 1u];
+        if (toc >= 0x00010000u && (toc & 3u) == 0 && toc != func_addr &&
+            ((i + 3u < 1024u && buf[i + 3u] == toc) || (i >= 2u && buf[i - 1u] == toc))) {
+          return addr + (i * 4u);
+        }
+      }
+    }
+  }
+  return 0;
+}
+
+static uint32_t emit_getinfo2_opd_stub(uint32_t *out, uint32_t orig_func) {
+  out[ 0] = 0x7C0802A6u; // mflr   r0
+  out[ 1] = 0xF821FF81u; // stdu   r1, -0x80(r1)
+  out[ 2] = 0xF8010090u; // std    r0, 0x90(r1)
+  out[ 3] = 0xFBE10078u; // std    r31, 0x78(r1)
+  out[ 4] = 0x7C7F1B78u; // mr     r31, r3
+  out[ 5] = 0x48000065u; // bl     call_orig ([30])
+  out[ 6] = 0x2C030000u; // cmpwi  r3, 0
+  out[ 7] = 0x40820048u; // bne    done ([25])
+  out[ 8] = 0x2C3F0000u; // cmpdi  r31, 0
+  out[ 9] = 0x41820040u; // beq    done ([25])
+  out[10] = 0x38A00007u; // li     r5, 7
+  out[11] = 0x7CA903A6u; // mtctr  r5
+  out[12] = 0x7FE6FB78u; // mr     r6, r31
+  out[13] = 0x38E0001Fu; // li     r7, 0x1F (DS3_SPOOF_CAPABILITIES)
+  out[14] = 0x39000000u; // li     r8, 0 (CELL_PAD_DEV_TYPE_STANDARD)
+  out[15] = 0x8126000Cu; // lwz    r9, 0x0C(r6) (port_status[i])
+  out[16] = 0x71290001u; // andi.  r9, r9, 1
+  out[17] = 0x41820018u; // beq    next ([23])
+  out[18] = 0x81260060u; // lwz    r9, 0x60(r6) (device_type[i])
+  out[19] = 0x2C090005u; // cmpwi  r9, 5 (CELL_PAD_DEV_TYPE_LDD)
+  out[20] = 0x4082000Cu; // bne    next ([23])
+  out[21] = 0x91060060u; // stw    r8, 0x60(r6)
+  out[22] = 0x90E60044u; // stw    r7, 0x44(r6)
+  out[23] = 0x38C60004u; // addi   r6, r6, 4
+  out[24] = 0x4200FFDCu; // bdnz   loop ([15])
+  out[25] = 0xEBE10078u; // ld     r31, 0x78(r1)
+  out[26] = 0xE8010090u; // ld     r0, 0x90(r1)
+  out[27] = 0x38210080u; // addi   r1, r1, 0x80
+  out[28] = 0x7C0803A6u; // mtlr   r0
+  out[29] = 0x4E800020u; // blr
+  out[30] = 0x3D800000u | (orig_func >> 16);     // lis   r12, hi
+  out[31] = 0x618C0000u | (orig_func & 0xFFFFu); // ori   r12, r12, lo
+  out[32] = 0x7D8903A6u;                         // mtctr r12
+  out[33] = 0x4E800420u;                         // bctr
+  return 34u;
+}
+
+static uint32_t emit_getdataextra_opd_stub(uint32_t *out, uint32_t orig_func) {
+  out[ 0] = 0x7C0802A6u; // mflr   r0
+  out[ 1] = 0xF821FF81u; // stdu   r1, -0x80(r1)
+  out[ 2] = 0xF8010090u; // std    r0, 0x90(r1)
+  out[ 3] = 0xFBE10078u; // std    r31, 0x78(r1)
+  out[ 4] = 0x7C9F2378u; // mr     r31, r4
+  out[ 5] = 0x4800003Du; // bl     call_orig ([20])
+  out[ 6] = 0x2C030000u; // cmpwi  r3, 0
+  out[ 7] = 0x41800020u; // blt    done ([15])
+  out[ 8] = 0x2C3F0000u; // cmpdi  r31, 0
+  out[ 9] = 0x41820018u; // beq    done ([15])
+  out[10] = 0x813F0000u; // lwz    r9, 0(r31)
+  out[11] = 0x2C090005u; // cmpwi  r9, 5
+  out[12] = 0x4082000Cu; // bne    done ([15])
+  out[13] = 0x39000000u; // li     r8, 0
+  out[14] = 0x911F0000u; // stw    r8, 0(r31)
+  out[15] = 0xEBE10078u; // ld     r31, 0x78(r1)
+  out[16] = 0xE8010090u; // ld     r0, 0x90(r1)
+  out[17] = 0x38210080u; // addi   r1, r1, 0x80
+  out[18] = 0x7C0803A6u; // mtlr   r0
+  out[19] = 0x4E800020u; // blr
+  out[20] = 0x3D800000u | (orig_func >> 16);     // lis   r12, hi
+  out[21] = 0x618C0000u | (orig_func & 0xFFFFu); // ori   r12, r12, lo
+  out[22] = 0x7D8903A6u;                         // mtctr r12
+  out[23] = 0x4E800420u;                         // bctr
+  return 24u;
+}
+
+static int32_t mem_spoof_process(uint32_t pid, const char *name) {
+  uint32_t *opd_info2, *opd_extra;
+  uint32_t vsh_info2, vsh_extra;
+  uint32_t sig_info2[8], sig_extra[8];
+  uint32_t info_funcs[4], extra_funcs[8];
+  uint32_t n_info, n_extra, k;
+  uint32_t cave, cave_words, cursor;
+  uint32_t stub_buf[128]; // max 512 bytes
+  uint32_t patched_any = 0;
+  int32_t r;
+
+  opd_info2 = resolve_vsh_opd((void *)cellPadGetInfo2);
+  opd_extra = resolve_vsh_opd((void *)cellPadGetDataExtra);
+  if (opd_info2 == NULL || opd_extra == NULL) {
+    xlog("mem-spoof: failed to resolve VSH cellPad OPDs");
+    return -2;
+  }
+  vsh_info2 = opd_info2[0];
+  vsh_extra = opd_extra[0];
+  memcpy(sig_info2, (const void *)(uintptr_t)vsh_info2, sizeof(sig_info2));
+  memcpy(sig_extra, (const void *)(uintptr_t)vsh_extra, sizeof(sig_extra));
+
+  n_info = find_game_funcs(pid, vsh_info2, sig_info2, 8u, info_funcs, 4u);
+  if (n_info == 0) {
+    xlog_proc("mem-spoof: cellPadGetInfo2 not found in", name, pid);
+    return -2;
+  }
+  n_extra = find_game_funcs(pid, vsh_extra, sig_extra, 8u, extra_funcs, 8u);
+
+  cave_words = 92u; // 2 * 34 (info) + 24 (extra) = 368 bytes
+  cave = find_eboot_cave(pid, cave_words * 4u);
+  if (cave == 0) {
+    cave_words = 34u; // minimum: 136 bytes for one info hook
+    cave = find_eboot_cave(pid, cave_words * 4u);
+  }
+  if (cave == 0) {
+    xlog_proc("mem-spoof: no EBOOT .text cave found in", name, pid);
+    return -2;
+  }
+
+  memset(stub_buf, 0, sizeof(stub_buf));
+  cursor = 0;
+
+  // Patch OPDs for all matched info functions (cellPadPeriphGetInfo + cellPadGetInfo2)
+  for (k = 0; k < n_info; k++) {
+    uint32_t opd_addr = find_opd_entry(pid, info_funcs[k]);
+    uint32_t stub_addr;
+    uint32_t words;
+    if (opd_addr == 0) {
+      continue;
+    }
+    if (cursor + 34u > cave_words) {
+      break;
+    }
+    stub_addr = cave + cursor * 4u;
+    words = emit_getinfo2_opd_stub(&stub_buf[cursor], info_funcs[k]);
+    if ((r = ps3mapi_set_proc_mem(pid, (uint64_t)stub_addr, &stub_buf[cursor], words * 4u)) < 0) {
+      xlog_code("mem-spoof: SET_PROC_MEM stub failed", r);
+      return r;
+    }
+    if ((r = ps3mapi_set_proc_mem(pid, (uint64_t)opd_addr, &stub_addr, 4u)) < 0) {
+      xlog_code("mem-spoof: SET_PROC_MEM OPD failed", r);
+      return r;
+    }
+    xlog_addr("mem-spoof: patched info OPD at", opd_addr);
+    xlog_addr("mem-spoof: -> stub at", stub_addr);
+    cursor += words;
+    patched_any = 1;
+  }
+
+  // Patch OPD for cellPadGetDataExtra (first match with li r7, 0 = 0x38E00000)
+  for (k = 0; k < n_extra; k++) {
+    uint32_t body[32];
+    uint32_t w, is_extra = 0, opd_addr, stub_addr, words;
+    if (ps3mapi_get_proc_mem(pid, (uint64_t)extra_funcs[k], body, sizeof(body)) == 0) {
+      for (w = 16u; w < 30u; w++) {
+        if (body[w] == 0x38E00000u) {
+          is_extra = 1;
+          break;
+        }
+      }
+    }
+    if (!is_extra) {
+      continue;
+    }
+    opd_addr = find_opd_entry(pid, extra_funcs[k]);
+    if (opd_addr == 0 || cursor + 24u > cave_words) {
+      break;
+    }
+    stub_addr = cave + cursor * 4u;
+    words = emit_getdataextra_opd_stub(&stub_buf[cursor], extra_funcs[k]);
+    if ((r = ps3mapi_set_proc_mem(pid, (uint64_t)stub_addr, &stub_buf[cursor], words * 4u)) == 0 &&
+        (r = ps3mapi_set_proc_mem(pid, (uint64_t)opd_addr, &stub_addr, 4u)) == 0) {
+      xlog_addr("mem-spoof: patched extra OPD at", opd_addr);
+      cursor += words;
+      patched_any = 1;
+    }
+    break;
+  }
+
+  return patched_any ? 0 : -2;
+}
+
 static int32_t pid_in_list(uint32_t pid, const uint32_t *pids) {
   int32_t i;
 
@@ -1795,8 +2239,14 @@ static void try_auto_inject(void) {
     }
   }
 
+  uint32_t found_game_pid = 0;
+
   for (i = 0; i < PS3MAPI_MAX_PROC; i++) {
-    if (pids[i] == 0 || already_injected(pids[i])) {
+    if (pids[i] == 0) {
+      continue;
+    }
+    if (already_injected(pids[i])) {
+      found_game_pid = pids[i];
       continue;
     }
     ps3mapi_get_proc_name(pids[i], name);
@@ -1804,6 +2254,7 @@ static void try_auto_inject(void) {
     if (name[0] == 0 || is_system_process(name)) {
       continue;
     }
+    found_game_pid = pids[i];
     // Do NOT inject a process the first time we see it. Injecting into a game
     // that is still booting hangs the kernel prx loader (the launch freeze -
     // see the XPAD_AUTO_INJECT note above). Age the candidate instead and only
@@ -1812,35 +2263,68 @@ static void try_auto_inject(void) {
     if (age < XPAD_INJECT_SETTLE_POLLS) {
       continue;
     }
-    // Log the process and the attempt BEFORE the syscall. Because each xlog()
-    // line is flushed with its own open/write/close and the log survives a
-    // reboot, this line is the breadcrumb that names which game we were
-    // injecting into if the console ever does lock up here.
     if (inject_log_budget > 0) {
       inject_log_budget--;
-      xlog_proc("auto-inject: loading xpad_game.sprx into", name, pids[i]);
+      xlog_proc("mem-spoof: patching DS3 spoof in", name, pids[i]);
     }
-    inject_call_t0 = time_now_usec();
-    r = ps3mapi_load_module(pids[i], XPAD_GAME_SPRX_PATH);
-    inject_call_t0 = 0;
-    if (is_syscall_disabled(r)) {
-      xlog("auto-inject: Syscall 8 / PS3MAPI disabled during load_module (stealth mode / HEN), disabling auto-inject");
+    r = mem_spoof_process(pids[i], name);
+    if ((uint32_t)r == 0x80010003u) {
+      xlog("mem-spoof: Syscall 8 / PS3MAPI disabled, disabling");
       ps3mapi_disabled = 1;
+      g_active_game_pid = 0;
       return;
     }
-    if (r >= 0) {
+    if (r == 0) {
       mark_injected(pids[i]);
-      pending_forget(pids[i]); // settled and injected: stop tracking it
+      pending_forget(pids[i]);
+    }
+    if (auto_inject_prx_enabled) {
       if (inject_log_budget > 0) {
         inject_log_budget--;
-        xlog_proc("auto-inject: loaded xpad_game.sprx OK into", name, pids[i]);
+        xlog_proc("auto-inject: loading xpad_game.sprx into", name, pids[i]);
       }
-    } else if (inject_log_budget > 0) {
-      // not marked injected: left in the pending table with its age pinned at
-      // the threshold, so it retries next pass. The budget keeps a persistent
-      // failure from flooding the log
-      inject_log_budget--;
-      xlog_code("auto-inject: load_module failed", r);
+      inject_call_t0 = time_now_usec();
+      r = ps3mapi_load_module(pids[i], XPAD_GAME_SPRX_PATH);
+      inject_call_t0 = 0;
+      if (is_syscall_disabled(r)) {
+        xlog("auto-inject: Syscall 8 / PS3MAPI disabled during load_module (stealth mode / HEN), disabling auto-inject");
+        ps3mapi_disabled = 1;
+        return;
+      }
+      if (r >= 0) {
+        mark_injected(pids[i]);
+        pending_forget(pids[i]); // settled and injected: stop tracking it
+        if (inject_log_budget > 0) {
+          inject_log_budget--;
+          xlog_proc("auto-inject: loaded xpad_game.sprx OK into", name, pids[i]);
+        }
+      } else if (inject_log_budget > 0) {
+        inject_log_budget--;
+        xlog_code("auto-inject: load_module failed", r);
+      }
+    }
+  }
+  g_active_game_pid = found_game_pid;
+
+  if (g_manual_spoof_req) {
+    g_manual_spoof_req = 0;
+    __asm__ __volatile__("sync" ::: "memory");
+    if (found_game_pid != 0) {
+      if (already_injected(found_game_pid)) {
+        show_msg((char *)"XPAD: DS3 Spoof Already Active");
+      } else {
+        ps3mapi_get_proc_name(found_game_pid, name);
+        name[sizeof(name) - 1] = 0;
+        xlog_proc("mem-spoof: manual Capture trigger in", name, found_game_pid);
+        r = mem_spoof_process(found_game_pid, name);
+        if (r == 0) {
+          mark_injected(found_game_pid);
+          pending_forget(found_game_pid);
+          show_msg((char *)"XPAD: DS3 Spoof Injected!");
+        } else {
+          show_msg((char *)"XPAD: DS3 Spoof Failed");
+        }
+      }
     }
   }
 }
@@ -1866,14 +2350,18 @@ static int32_t auto_inject_opted_in(void) {
 // untouched. On a normal shutdown the thread notices 'running' going to 0
 // within one sleep period and exits; xpadd_stop_thread joins it.
 static void inject_thread(uint64_t arg) {
+  int32_t t;
   (void)arg;
   while (running && !ps3mapi_disabled) {
-    sys_timer_sleep(2);
+    for (t = 0; t < 10 && running && !ps3mapi_disabled && !g_manual_spoof_req; t++) {
+      sys_timer_usleep(200000);
+    }
     if (!running || ps3mapi_disabled) {
       break;
     }
     try_auto_inject();
   }
+  g_active_game_pid = 0;
   sys_ppu_thread_exit(0);
 }
 #endif // XPAD_AUTO_INJECT
@@ -3094,18 +3582,8 @@ static void swpro_read_report(XPAD_UNIT_t *unit, int32_t id, uint8_t *readBuf, i
       return;
     }
 
-    /* Toggle XMB terminal overlay on Star/Capture button rising edge */
-    if (unit != NULL) {
-      uint8_t star_now = (btn_shared & SWPRO_BTN_CAPTURE) ? 1 : 0;
-      if (star_now && !unit->swpro_star_prev) {
-        uint8_t was_open = xmb_ui_is_open();
-        xmb_ui_toggle();
-        if (was_open && !xmb_ui_is_open()) {
-          unit->swpro_post_close_guard = 1;
-        }
-      }
-      unit->swpro_star_prev = star_now;
-    }
+    /* Toggle XMB overlay in XMB, or trigger DS3 spoof injection in-game */
+    swpro_handle_capture_btn(unit, (btn_shared & SWPRO_BTN_CAPTURE) ? 1 : 0);
 
     uint16_t lx_12 = (uint16_t)readBuf[6] | ((uint16_t)(readBuf[7] & 0x0F) << 8);
     uint16_t ly_12 = (uint16_t)(readBuf[7] >> 4) | ((uint16_t)readBuf[8] << 4);
@@ -3130,10 +3608,9 @@ static void swpro_read_report(XPAD_UNIT_t *unit, int32_t id, uint8_t *readBuf, i
       }
       if (btn_shared & SWPRO_BTN_PLUS)  nav |= UI_NAV_CONFIRM;
       if (btn_shared & SWPRO_BTN_MINUS) nav |= UI_NAV_BACK;
-      xmb_ui_handle_input(nav);
-      if (!xmb_ui_is_open() && unit != NULL) {
-        unit->swpro_post_close_guard = 1;
-      }
+      s_pending_ui_nav = nav;
+      s_has_pending_ui_nav = 1;
+      s_pending_ui_unit = unit;
       cellPadLddDataInsert(handle[id], &data);
       return;
     }
@@ -3301,17 +3778,7 @@ static void swpro_read_report(XPAD_UNIT_t *unit, int32_t id, uint8_t *readBuf, i
       return;
     }
 
-    if (unit != NULL) {
-      uint8_t star_now = (b & (1 << 13)) ? 1 : 0;
-      if (star_now && !unit->swpro_star_prev) {
-        uint8_t was_open = xmb_ui_is_open();
-        xmb_ui_toggle();
-        if (was_open && !xmb_ui_is_open()) {
-          unit->swpro_post_close_guard = 1;
-        }
-      }
-      unit->swpro_star_prev = star_now;
-    }
+    swpro_handle_capture_btn(unit, (b & (1 << 13)) ? 1 : 0);
 
     if (xmb_ui_is_open()) {
       uint32_t nav = 0;
@@ -3328,16 +3795,15 @@ static void swpro_read_report(XPAD_UNIT_t *unit, int32_t id, uint8_t *readBuf, i
       }
       if (b & (1 << 9)) nav |= UI_NAV_CONFIRM;
       if (b & (1 << 8)) nav |= UI_NAV_BACK;
-      xmb_ui_handle_input(nav);
-      if (!xmb_ui_is_open() && unit != NULL) {
-        unit->swpro_post_close_guard = 1;
-      }
+      s_pending_ui_nav = nav;
+      s_has_pending_ui_nav = 1;
+      s_pending_ui_unit = unit;
       cellPadLddDataInsert(handle[id], &data);
       return;
     }
 
     if (unit != NULL && unit->swpro_post_close_guard) {
-      if ((b & ~(1 << 13)) == 0 && hat == 0x08) {
+      if ((b & 0x1FFFU) == 0 && hat > 7) {
         unit->swpro_post_close_guard = 0;
       } else {
         cellPadLddDataInsert(handle[id], &data);
@@ -3855,6 +4321,7 @@ static int32_t shutdown_usb(void) {
 
 static void ui_on_conn_mode_changed(uint8_t new_mode) {
   if (new_mode == XPAD_CONN_WIRED) {
+    xmb_ui_close();
     btd_set_paused(1);
     btd_disconnect();
   } else {
@@ -3971,6 +4438,14 @@ static void xpadd_thread(uint64_t arg) {
     }
     show_msg(msg);
   }
+  if (stop_requested) {
+    xpad_detach_all();
+    xpadw_detach_all();
+    swpro_detach_all();
+    btd_detach_all();
+    shutdown_usb();
+    sys_ppu_thread_exit(0);
+  }
   running = 1;
   {
     xmb_ui_callbacks_t ui_cb;
@@ -3995,14 +4470,16 @@ static void xpadd_thread(uint64_t arg) {
   // stall the input pump below (the INPUT-DEATH FIX note above). Low
   // priority: injection is a background convenience, input is not. If the
   // thread cannot be created, run without auto-injection rather than risk it.
-  if (!auto_inject_opted_in()) {
-    xlog("auto-inject: disabled (no /dev_hdd0/plugins/xpad_auto_inject.txt); use webMAN Game Plugins for rumble");
-  } else if (sys_ppu_thread_create(&inject_thread_id, inject_thread, 0ULL, 1000, 0x2000,
-                                   SYS_PPU_THREAD_CREATE_JOINABLE, INJECT_THREAD_NAME) != CELL_OK) {
-    inject_thread_id = (sys_ppu_thread_t)-1;
-    xlog("auto-inject: thread create failed, auto-injection disabled");
+  auto_inject_prx_enabled = (uint8_t)auto_inject_opted_in();
+  if (!auto_inject_prx_enabled) {
+    xlog("auto-inject: PRX load disabled (no xpad_auto_inject.txt); using SET_PROC_MEM DS3 spoofing");
   } else {
-    xlog("auto-inject: enabled (opt-in file present)");
+    xlog("auto-inject: PRX load enabled (opt-in file present)");
+  }
+  if (sys_ppu_thread_create(&inject_thread_id, inject_thread, 0ULL, 1000, 0x2000,
+                            SYS_PPU_THREAD_CREATE_JOINABLE, INJECT_THREAD_NAME) != CELL_OK) {
+    inject_thread_id = (sys_ppu_thread_t)-1;
+    xlog("mem-spoof: thread create failed, DS3 memory spoofing disabled");
   }
 #endif
   while (running) {
@@ -4048,7 +4525,33 @@ static void xpadd_thread(uint64_t arg) {
       }
     }
     unblock(xpad_mutex);
-    xmb_ui_render_xmb();
+    if (s_has_pending_ui_nav) {
+      uint32_t nav = s_pending_ui_nav;
+      XPAD_UNIT_t *nav_unit = s_pending_ui_unit;
+      s_has_pending_ui_nav = 0;
+      s_pending_ui_unit = NULL;
+      xmb_ui_handle_input(nav);
+      if (!xmb_ui_is_open() && nav_unit != NULL) {
+        nav_unit->swpro_post_close_guard = 1;
+      }
+    }
+    {
+      uint32_t active_pid = g_active_game_pid;
+      uint8_t any_unit = 0;
+      for (i = 0; i < MAX_UNIT_NUM; i++) {
+        if (XPAD.units[i] != NULL) {
+          any_unit = 1;
+          break;
+        }
+      }
+      if (active_pid != 0 || !any_unit) {
+        if (xmb_ui_is_open()) {
+          xmb_ui_close();
+        }
+      } else {
+        xmb_ui_render_xmb();
+      }
+    }
 
     // forward rumble events from the game-process plugin to the USB pads
     // (route_rumble() takes xpad_mutex itself, so drain outside the lock)
@@ -4068,11 +4571,13 @@ static void xpadd_thread(uint64_t arg) {
   }
 
   // exiting...
+  xmb_ui_close();
   xpad_detach_all();
   xpadw_detach_all();
   swpro_detach_all();
   btd_detach_all();
   shutdown_usb();
+  g_active_game_pid = 0;
   sys_ppu_thread_exit(0);
 }
 
@@ -4088,8 +4593,8 @@ static void xpadd_stop_thread(uint64_t arg) {
   int32_t i;
 #endif
 
+  stop_requested = 1;
   running = 0;
-  xmb_ui_close();
   sys_timer_usleep(500000);
 #if XPAD_AUTO_INJECT
   if (inject_thread_id != (sys_ppu_thread_t)-1) {
@@ -4117,6 +4622,7 @@ static void xpadd_stop_thread(uint64_t arg) {
     sys_ppu_thread_join(thread_id, &exit_code);
   }
   show_msg((char *)"XPAD Unloaded!");
+  g_active_game_pid = 0;
   sys_ppu_thread_exit(0);
 }
 

@@ -47,13 +47,23 @@ test_hen_integration.exe
 if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
 
 echo.
-echo [4/4] Compiling and running test_xmb_ui...
+echo [4/5] Compiling and running test_xmb_ui...
 cl /nologo /W3 /O2 test_xmb_ui.c /Fe:test_xmb_ui.exe >nul
 if %ERRORLEVEL% neq 0 (
     echo Failed to build test_xmb_ui
     exit /b 1
 )
 test_xmb_ui.exe
+if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
+
+echo.
+echo [5/5] Compiling and running test_ds3_spoof...
+cl /nologo /W3 /O2 test_ds3_spoof.c /Fe:test_ds3_spoof.exe >nul
+if %ERRORLEVEL% neq 0 (
+    echo Failed to build test_ds3_spoof
+    exit /b 1
+)
+test_ds3_spoof.exe
 if %ERRORLEVEL% neq 0 exit /b %ERRORLEVEL%
 
 echo.
